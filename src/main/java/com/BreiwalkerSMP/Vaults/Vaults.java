@@ -19,7 +19,6 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
-import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
@@ -28,260 +27,398 @@ import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.util.io.BukkitObjectInputStream;
 import org.bukkit.util.io.BukkitObjectOutputStream;
-import org.yaml.snakeyaml.external.biz.base64Coder.Base64Coder;
 
-import java.io.*;
-import java.util.*;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
 import java.util.concurrent.locks.ReentrantLock;
 
 public class Vaults extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
 
-    private static final boolean IS_FOLIA = hasClass("io.papermc.paper.threadedregions.RegionScheduler");
+    private static final boolean IS_FOLIA =
+            hasClass("io.papermc.paper.threadedregions.RegionScheduler");
 
-    // Cache für aktive Inventar-Instanzen
-    private final Map<String, Inventory> activeVaultInventories = new ConcurrentHashMap<>();
-    // Locks pro Inventar, um Thread-Safety zu garantieren (Folia)
-    private final Map<String, ReentrantLock> vaultLocks = new ConcurrentHashMap<>();
-    // Laufende asynchrone Ladevorgänge (damit nicht mehrfach geladen wird)
-    private final Map<String, CompletableFuture<Inventory>> loadingFutures = new ConcurrentHashMap<>();
+    /** Authoritative in-memory sessions (may have multiple viewers). */
+    private final Map<String, VaultSession> sessions = new ConcurrentHashMap<>();
+    /** In-flight loads so concurrent openers share the same result. */
+    private final Map<String, CompletableFuture<VaultSession>> loadingFutures = new ConcurrentHashMap<>();
+    /** Per-key chained save futures (latest snapshot always wins). */
+    private final Map<String, CompletableFuture<Void>> pendingSaves = new ConcurrentHashMap<>();
 
     private File userDataFolder;
     private NamespacedKey navKey;
+    private Executor asyncExecutor;
 
-    // Custom Inventory Holder (behebt Title-Anvil-Dupe)
-    public static class VaultHolder implements InventoryHolder {
+    // ─── Holder & Session ────────────────────────────────────────────────
+
+    public static final class VaultHolder implements InventoryHolder {
         private final UUID ownerUUID;
         private final int page;
+        private Inventory inventory;      // set once created
 
-        public VaultHolder(UUID ownerUUID, int page) {
-            this.ownerUUID = ownerUUID;
-            this.page = page;
-        }
-
+        public VaultHolder(UUID ownerUUID, int page) { this.ownerUUID = ownerUUID; this.page = page; }
+        void setInventory(Inventory inv) { this.inventory = inv; }
         public UUID getOwnerUUID() { return ownerUUID; }
         public int getPage() { return page; }
-
-        @Override
-        public Inventory getInventory() { return null; }
+        @Override public Inventory getInventory() { return inventory; }
     }
+
+    private static final class VaultSession {
+        final UUID owner;
+        final int page;
+        final Inventory inventory;
+        final ReentrantLock lock = new ReentrantLock();
+
+        VaultSession(UUID owner, int page, Inventory inv) {
+            this.owner = owner; this.page = page; this.inventory = inv;
+        }
+    }
+
+    // ─── Lifecycle ───────────────────────────────────────────────────────
 
     @Override
     public void onEnable() {
         saveDefaultConfig();
+
         userDataFolder = new File(getDataFolder(), "userdata");
-        if (!userDataFolder.exists()) userDataFolder.mkdirs();
-
-
+        if (!userDataFolder.exists() && !userDataFolder.mkdirs()) {
+            getLogger().severe("Could not create userdata directory!");
+        }
 
         navKey = new NamespacedKey(this, "nav");
 
-        getCommand("vault").setExecutor(this);
-        getCommand("vault").setTabCompleter(this);
+        if (IS_FOLIA) {
+            asyncExecutor = r -> Bukkit.getAsyncScheduler().runNow(this, t -> r.run());
+        } else {
+            asyncExecutor = r -> Bukkit.getScheduler().runTaskAsynchronously(this, r);
+        }
+
+        var cmd = getCommand("vault");
+        if (cmd == null) {
+            getLogger().severe("Command 'vault' missing from plugin.yml!");
+        } else {
+            cmd.setExecutor(this);
+            cmd.setTabCompleter(this);
+        }
+
         getServer().getPluginManager().registerEvents(this, this);
     }
 
-    // ─── Threading-Kompatibilität ─────────────────────────────────────────
+    @Override
+    public void onDisable() {
+        // Synchronously flush every open session so nothing is lost on reload/crash-shutdown.
+        for (VaultSession s : sessions.values()) {
+            try {
+                String serialised = itemStackArrayToBase64(snapshot(s.inventory));
+                writePageToDisk(s.owner, s.page, serialised);
+            } catch (Exception ex) {
+                getLogger().warning("Failed to flush vault " + s.owner + " p" + s.page + ": " + ex.getMessage());
+            }
+        }
+        sessions.clear();
+        loadingFutures.clear();
+        pendingSaves.clear();
+    }
 
-    private void runAsync(Runnable runnable) {
+    // ─── Threading helpers ───────────────────────────────────────────────
+
+    private static boolean hasClass(String cn) {
+        try { Class.forName(cn); return true; }
+        catch (ClassNotFoundException e) { return false; }
+    }
+
+    private String key(UUID owner, int page) { return owner + ":" + page; }
+
+    private void runOnMain(Runnable r) {
         if (IS_FOLIA) {
-            Bukkit.getAsyncScheduler().runNow(this, task -> runnable.run());
+            Bukkit.getGlobalRegionScheduler().run(this, t -> r.run());
+        } else if (Bukkit.isPrimaryThread()) {
+            r.run();
         } else {
-            Bukkit.getScheduler().runTaskAsynchronously(this, runnable);
+            Bukkit.getScheduler().runTask(this, r);
         }
     }
 
-    private void runOnPlayer(Player player, Runnable runnable) {
+    private void runOnPlayer(Player p, Runnable r) {
         if (IS_FOLIA) {
-            player.getScheduler().run(this, task -> runnable.run(), null);
+            p.getScheduler().run(this, t -> r.run(), null);
         } else {
-            Bukkit.getScheduler().runTask(this, runnable);
+            Bukkit.getScheduler().runTask(this, r);
         }
     }
 
-    private static boolean hasClass(String className) {
-        try {
-            Class.forName(className);
-            return true;
-        } catch (ClassNotFoundException e) {
-            return false;
-        }
-    }
-
-    // ─── Command Handler ──────────────────────────────────────────────────
+    // ─── Command handling ────────────────────────────────────────────────
 
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
-        if (!(sender instanceof Player player)) return true;
-
-        if (args.length > 0) {
-            String sub = args[0].toLowerCase();
-
-            if (sub.equals("shared")) {
-                showSharedList(player);
-                return true;
-            }
-
-            if (sub.equals("share") && args.length >= 2) {
-                String targetName = args[1];
-                runAsync(() -> {
-                    @SuppressWarnings("deprecation")
-                    Player target = Bukkit.getPlayer(targetName);
-                    if (target == null) {
-                        player.sendMessage(Component.text("§cSpieler offline."));
-                        return;
-                    }
-                    addSharedPlayer(player.getUniqueId(), target.getUniqueId());
-                    player.sendMessage(Component.text("§aVault geteilt mit §e" + target.getName()));
-                });
-                return true;
-            }
-
-            // Öffnen des Vaults eines anderen Spielers
-            String lookupName = args[0];
-            runAsync(() -> {
-                @SuppressWarnings("deprecation")
-                UUID targetUUID = Bukkit.getOfflinePlayer(lookupName).getUniqueId();
-                // Berechtigungsprüfung asynchron
-                boolean allowed = isSharedWith(targetUUID, player.getUniqueId()) || player.isOp() || player.hasPermission("vaults.admin");
-                if (allowed) {
-                    runOnPlayer(player, () -> openVault(player, 1, targetUUID));
-                } else {
-                    player.sendMessage(Component.text("§cKeine Berechtigung."));
-                }
-            });
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage("Only players may use this command.");
             return true;
         }
 
-        // Eigenen Vault öffnen
+        if (args.length > 0) {
+            String sub = args[0].toLowerCase(Locale.ROOT);
+
+            if (sub.equals("shared")) { showSharedList(player); return true; }
+
+            if (sub.equals("share") && args.length >= 2) {
+                final UUID self = player.getUniqueId();
+                final String targetName = args[1];
+                CompletableFuture.runAsync(() -> {
+                    Player target = Bukkit.getPlayerExact(targetName);
+                    if (target == null) {
+                        runOnPlayer(player, () -> player.sendMessage(Component.text("§cSpieler offline.")));
+                        return;
+                    }
+                    addSharedPlayer(self, target.getUniqueId());
+                    runOnPlayer(player, () -> player.sendMessage(Component.text("§aVault geteilt mit §e" + target.getName())));
+                }, asyncExecutor);
+                return true;
+            }
+
+            final String lookupName = args[0];
+            CompletableFuture.runAsync(() -> {
+                UUID targetUUID = Bukkit.getOfflinePlayer(lookupName).getUniqueId();
+                boolean allowed = player.isOp()
+                        || player.hasPermission("vaults.admin")
+                        || isSharedWith(targetUUID, player.getUniqueId());
+                if (allowed) {
+                    runOnPlayer(player, () -> openVault(player, 1, targetUUID));
+                } else {
+                    runOnPlayer(player, () -> player.sendMessage(Component.text("§cKeine Berechtigung.")));
+                }
+            }, asyncExecutor);
+            return true;
+        }
+
         openVault(player, 1, player.getUniqueId());
         return true;
     }
 
-    // ─── Vault-Logik (asynchrones Laden, threadsicher) ────────────────────
+    // ─── Vault open logic ────────────────────────────────────────────────
 
     public void openVault(Player player, int page, UUID targetUUID) {
-        int rows = getConfig().getInt("vault-settings.rows", 6);
-        int totalPages = getConfig().getInt("vault-settings.total-pages", 2);
-        String rawTitle = getConfig().getString("vault-settings.title", "Vault %page%")
-                .replace("%page%", String.valueOf(page));
-        Component titleComponent = LegacyComponentSerializer.legacySection().deserialize(rawTitle);
+        final int totalPages = Math.max(1, getConfig().getInt("vault-settings.total-pages", 2));
+        if (page < 1 || page > totalPages) return;
 
-        String cacheKey = targetUUID.toString() + ":" + page;
-        Inventory cached = activeVaultInventories.get(cacheKey);
+        final int rows = Math.max(1, Math.min(6, getConfig().getInt("vault-settings.rows", 6)));
+        final String rawTitle = getConfig().getString("vault-settings.title", "Vault %page%")
+                .replace("%page%", String.valueOf(page));
+        final Component title = LegacyComponentSerializer.legacySection().deserialize(rawTitle);
+
+        final String cacheKey = key(targetUUID, page);
+
+        VaultSession cached = sessions.get(cacheKey);
         if (cached != null) {
-            // Bereits geladen – nur noch öffnen
-            openCachedInventory(player, cached, page, totalPages);
+            openSession(player, cached, totalPages);
             return;
         }
 
-        // Asynchrones Laden starten
-        CompletableFuture<Inventory> future = loadingFutures.get(cacheKey);
+        CompletableFuture<VaultSession> future = loadingFutures.get(cacheKey);
         if (future == null) {
-            future = CompletableFuture.supplyAsync(() -> {
-                        // Inventar-Erstellung & Datenladen (auf asynchronem Thread, da Bukkit.createInventory threadsicher ist)
-                        Inventory newInv = Bukkit.createInventory(new VaultHolder(targetUUID, page), rows * 9, titleComponent);
-                        File userFile = getPlayerFile(targetUUID);
-                        if (userFile.exists()) {
-                            FileConfiguration config = YamlConfiguration.loadConfiguration(userFile);
-                            String data = config.getString("pages.page-" + page);
-                            if (data != null && !data.isEmpty()) {
-                                try {
-                                    ItemStack[] loaded = itemStackArrayFromBase64(data);
-                                    int copyLen = Math.min(loaded.length, newInv.getSize());
-                                    for (int i = 0; i < copyLen; i++) {
-                                        if (loaded[i] != null && !isNavItem(loaded[i])) {
-                                            newInv.setItem(i, loaded[i]);
-                                        }
-                                    }
-                                } catch (Exception ignored) {}
-                            }
-                        }
-                        return newInv;
-                    }, runnable -> runAsync(runnable)) // asynchron ausführen
-                    .thenApply(inv -> {
-                        // Nach erfolgreichem Laden: registrieren und öffnen
-                        runOnPlayer(player, () -> {
-                            activeVaultInventories.put(cacheKey, inv);
-                            vaultLocks.put(cacheKey, new ReentrantLock());
-                            openCachedInventory(player, inv, page, totalPages);
-                        });
-                        return inv;
-                    });
-            loadingFutures.put(cacheKey, future);
-            future.whenComplete((inv, ex) -> loadingFutures.remove(cacheKey));
-        }
+            CompletableFuture<ItemStack[]> loadFuture = CompletableFuture.supplyAsync(
+                    () -> loadItems(targetUUID, page), asyncExecutor);
 
-        // Dem Spieler Bescheid geben, falls das Laden dauert (optional)
-        future.thenAccept(inv -> runOnPlayer(player, () -> openCachedInventory(player, inv, page, totalPages)));
-    }
-
-    private void openCachedInventory(Player player, Inventory inv, int page, int totalPages) {
-        // Navigations-Buttons auffrischen (ohne Lock, da nur lesend)
-        int size = inv.getSize();
-        inv.setItem(size - 1, page < totalPages ? createNavItem(Material.ARROW, "§eNext →", "next") : null);
-        inv.setItem(size - 9, page > 1 ? createNavItem(Material.ARROW, "§e← Prev", "prev") : null);
-
-        player.openInventory(inv);
-        player.playSound(player.getLocation(), Sound.BLOCK_ENDER_CHEST_OPEN, 1.0f, 1.0f);
-    }
-
-    private void saveVaultContent(UUID ownerUUID, int page, Inventory inv) {
-        ReentrantLock lock = vaultLocks.get(ownerUUID.toString() + ":" + page);
-        if (lock != null) lock.lock();
-        ItemStack[] contents;
-        try {
-            // Tiefe Kopie während der Lock haltend
-            ItemStack[] raw = inv.getContents();
-            contents = new ItemStack[raw.length];
-            for (int i = 0; i < raw.length; i++) {
-                if (raw[i] != null && !isNavItem(raw[i])) {
-                    contents[i] = raw[i].clone();
+            CompletableFuture<VaultSession> created = new CompletableFuture<>();
+            loadFuture.thenAccept(items -> runOnMain(() -> {
+                try {
+                    VaultHolder holder = new VaultHolder(targetUUID, page);
+                    Inventory inv = Bukkit.createInventory(holder, rows * 9, title);
+                    holder.setInventory(inv);
+                    int max = Math.min(items.length, inv.getSize());
+                    for (int i = 0; i < max; i++) {
+                        ItemStack it = items[i];
+                        if (it != null && !isNavItem(it)) inv.setItem(i, it);
+                    }
+                    created.complete(new VaultSession(targetUUID, page, inv));
+                } catch (Throwable t) {
+                    created.completeExceptionally(t);
                 }
+            }));
+
+            CompletableFuture<VaultSession> existing = loadingFutures.putIfAbsent(cacheKey, created);
+            if (existing != null) {
+                future = existing;
+            } else {
+                future = created;
+                created.whenComplete((s, ex) -> loadingFutures.remove(cacheKey, created));
             }
-        } finally {
-            if (lock != null) lock.unlock();
         }
 
-        ItemStack[] serializationSnapshot = contents; // bereits geklont
-        runAsync(() -> {
-            String serialised = itemStackArrayToBase64(serializationSnapshot);
-            File f = getPlayerFile(ownerUUID);
-            FileConfiguration cfg = YamlConfiguration.loadConfiguration(f);
-            cfg.set("pages.page-" + page, serialised);
-            try {
-                cfg.save(f);
-            } catch (IOException ignored) {}
+        future.thenAccept(session -> {
+            sessions.putIfAbsent(cacheKey, session);
+            VaultSession actual = sessions.get(cacheKey);
+            if (!player.isOnline()) return;
+            runOnPlayer(player, () -> {
+                if (player.isOnline()) openSession(player, actual, totalPages);
+            });
+        }).exceptionally(ex -> {
+            getLogger().warning("Failed to load vault " + cacheKey + ": " + ex);
+            if (player.isOnline()) {
+                runOnPlayer(player, () -> player.sendMessage(Component.text("§cVault konnte nicht geladen werden.")));
+            }
+            return null;
         });
     }
 
-    // ─── Events (Exploit- und Dupe-Schutz) ────────────────────────────────
+    private void openSession(Player player, VaultSession session, int totalPages) {
+        ReentrantLock lock = session.lock;
+        lock.lock();
+        try {
+            Inventory inv = session.inventory;
+            int size = inv.getSize();
+            inv.setItem(size - 1, session.page < totalPages
+                    ? createNavItem(Material.ARROW, "§eNext →", "next") : null);
+            inv.setItem(size - 9, session.page > 1
+                    ? createNavItem(Material.ARROW, "§e← Prev", "prev") : null);
+        } finally {
+            lock.unlock();
+        }
+        player.openInventory(session.inventory);
+        player.playSound(player.getLocation(), Sound.BLOCK_ENDER_CHEST_OPEN, 1.0f, 1.0f);
+    }
+
+    // ─── Persistence ─────────────────────────────────────────────────────
+
+    private ItemStack[] loadItems(UUID owner, int page) {
+        File f = getPlayerFile(owner);
+        if (!f.exists()) return new ItemStack[0];
+        try {
+            FileConfiguration cfg = YamlConfiguration.loadConfiguration(f);
+            String data = cfg.getString("pages.page-" + page);
+            if (data == null || data.isEmpty()) return new ItemStack[0];
+            return itemStackArrayFromBase64(data);
+        } catch (Exception ex) {
+            getLogger().warning("Failed to deserialize vault " + owner + " p" + page + ": " + ex.getMessage());
+            return new ItemStack[0];
+        }
+    }
+
+    private ItemStack[] snapshot(Inventory inv) {
+        ItemStack[] raw = inv.getContents();
+        ItemStack[] out = new ItemStack[raw.length];
+        for (int i = 0; i < raw.length; i++) {
+            if (raw[i] != null && !isNavItem(raw[i])) out[i] = raw[i].clone();
+        }
+        return out;
+    }
+
+    /** Capture a snapshot and enqueue a chained, ordered save. */
+    private void saveVaultContent(UUID ownerUUID, int page, Inventory inv) {
+        final String cacheKey = key(ownerUUID, page);
+
+        ItemStack[] snap;
+        VaultSession session = sessions.get(cacheKey);
+        if (session != null) {
+            session.lock.lock();
+            try { snap = snapshot(inv); }
+            finally { session.lock.unlock(); }
+        } else {
+            snap = snapshot(inv);
+        }
+        final ItemStack[] finalSnap = snap;
+
+        // Chain so newer saves always run after older ones (never out of order).
+        CompletableFuture<Void> prev = pendingSaves.getOrDefault(cacheKey, CompletableFuture.completedFuture(null));
+        CompletableFuture<Void> chained = prev.thenRunAsync(() -> {
+            try {
+                writePageToDisk(ownerUUID, page, itemStackArrayToBase64(finalSnap));
+            } catch (Exception ex) {
+                getLogger().warning("Failed to save vault " + cacheKey + ": " + ex.getMessage());
+            }
+        }, asyncExecutor);
+
+        pendingSaves.put(cacheKey, chained);
+        chained.whenComplete((v, e) -> {
+            pendingSaves.remove(cacheKey, chained);
+            tryEvict(cacheKey);
+        });
+    }
+
+    private void writePageToDisk(UUID owner, int page, String serialised) throws IOException {
+        File f = getPlayerFile(owner);
+        FileConfiguration cfg = f.exists() ? YamlConfiguration.loadConfiguration(f) : new YamlConfiguration();
+        cfg.set("pages.page-" + page, serialised);
+        cfg.save(f);
+    }
+
+    /** Evict cache only when no viewers AND no pending save — prevents stale-reload dupes. */
+    private void tryEvict(String cacheKey) {
+        Runnable check = () -> {
+            VaultSession s = sessions.get(cacheKey);
+            if (s == null) return;
+            if (!s.inventory.getViewers().isEmpty()) return;
+            CompletableFuture<Void> p = pendingSaves.get(cacheKey);
+            if (p != null && !p.isDone()) return;
+            sessions.remove(cacheKey, s);
+        };
+        if (!IS_FOLIA && Bukkit.isPrimaryThread()) check.run();
+        else runOnMain(check);
+    }
+
+    // ─── Serialization ───────────────────────────────────────────────────
+
+    public String itemStackArrayToBase64(ItemStack[] items) throws Exception {
+        try (ByteArrayOutputStream os = new ByteArrayOutputStream();
+             BukkitObjectOutputStream out = new BukkitObjectOutputStream(os)) {
+            out.writeInt(items.length);
+            for (ItemStack item : items) out.writeObject(item);
+            out.flush();
+            return Base64.getEncoder().encodeToString(os.toByteArray());
+        }
+    }
+
+    public ItemStack[] itemStackArrayFromBase64(String data) throws Exception {
+        // MIME decoder tolerates both old line-wrapped Base64Coder output and new single-line data.
+        byte[] bytes = Base64.getMimeDecoder().decode(data);
+        try (ByteArrayInputStream is = new ByteArrayInputStream(bytes);
+             BukkitObjectInputStream in = new BukkitObjectInputStream(is)) {
+            int len = in.readInt();
+            ItemStack[] items = new ItemStack[len];
+            for (int i = 0; i < len; i++) items[i] = (ItemStack) in.readObject();
+            return items;
+        }
+    }
+
+    // ─── Events ──────────────────────────────────────────────────────────
 
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onInvClick(InventoryClickEvent e) {
         if (!(e.getInventory().getHolder() instanceof VaultHolder holder)) return;
-        ReentrantLock lock = vaultLocks.get(holder.getOwnerUUID().toString() + ":" + holder.getPage());
+        ReentrantLock lock = sessionLock(holder);
         if (lock != null) lock.lock();
         try {
             Player p = (Player) e.getWhoClicked();
             int slot = e.getRawSlot();
             int size = e.getInventory().getSize();
 
-            // Navigations-Slots blockieren
+            // Navigation slots
             if (slot == size - 1 || slot == size - 9) {
                 e.setCancelled(true);
                 ItemStack clicked = e.getCurrentItem();
                 if (clicked != null && isNavItem(clicked)) {
-                    String nav = clicked.getItemMeta().getPersistentDataContainer().get(navKey, PersistentDataType.STRING);
-                    int nextPage = holder.getPage() + ("next".equals(nav) ? 1 : -1);
-                    // Seite wechseln (ohne Lock, da openVault eigenen Lock verwendet)
-                    openVault(p, nextPage, holder.getOwnerUUID());
+                    String nav = clicked.getItemMeta().getPersistentDataContainer()
+                            .get(navKey, PersistentDataType.STRING);
+                    if (nav != null) {
+                        int nextPage = holder.getPage() + ("next".equals(nav) ? 1 : -1);
+                        // Defer so we don't reenter while holding the lock.
+                        runOnPlayer(p, () -> openVault(p, nextPage, holder.getOwnerUUID()));
+                    }
                 }
                 return;
             }
 
-            // Nav-Items aus Inventar entfernen/ablehnen
+            // Defensive: any nav item outside the nav slots must not be movable.
             if (e.getCurrentItem() != null && isNavItem(e.getCurrentItem())) {
                 e.setCancelled(true);
                 e.setCurrentItem(null);
@@ -298,20 +435,13 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onInvDrag(InventoryDragEvent e) {
         if (!(e.getInventory().getHolder() instanceof VaultHolder holder)) return;
-        ReentrantLock lock = vaultLocks.get(holder.getOwnerUUID().toString() + ":" + holder.getPage());
+        ReentrantLock lock = sessionLock(holder);
         if (lock != null) lock.lock();
         try {
-            // Nav-Item am Cursor? Dann ganzen Drag abbrechen
-            if (isNavItem(e.getOldCursor())) {
-                e.setCancelled(true);
-                return;
-            }
+            if (isNavItem(e.getOldCursor())) { e.setCancelled(true); return; }
             int size = e.getInventory().getSize();
             for (int slot : e.getRawSlots()) {
-                if (slot == size - 1 || slot == size - 9) {
-                    e.setCancelled(true);
-                    return;
-                }
+                if (slot == size - 1 || slot == size - 9) { e.setCancelled(true); return; }
             }
         } finally {
             if (lock != null) lock.unlock();
@@ -321,31 +451,24 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
     @EventHandler(priority = EventPriority.MONITOR)
     public void onInvClose(InventoryCloseEvent e) {
         if (!(e.getInventory().getHolder() instanceof VaultHolder holder)) return;
-
-        // Inventar speichern (mit Lock)
-        saveVaultContent(holder.getOwnerUUID(), holder.getPage(), e.getInventory());
-
-        // Cache nur leeren, wenn wirklich kein Spieler mehr die Seite offen hat
-        if (e.getInventory().getViewers().isEmpty()) {
-            String cacheKey = holder.getOwnerUUID().toString() + ":" + holder.getPage();
-            activeVaultInventories.remove(cacheKey);
-            vaultLocks.remove(cacheKey);
-        }
+        Inventory inv = e.getInventory();
+        String k = key(holder.getOwnerUUID(), holder.getPage());
+        saveVaultContent(holder.getOwnerUUID(), holder.getPage(), inv);
+        if (inv.getViewers().isEmpty()) tryEvict(k);
     }
 
-    @EventHandler(priority = EventPriority.MONITOR)
-    public void onQuit(PlayerQuitEvent e) {
-        // Bukkit ruft InventoryCloseEvent automatisch vorher auf – nichts weiter nötig.
+    private ReentrantLock sessionLock(VaultHolder holder) {
+        VaultSession s = sessions.get(key(holder.getOwnerUUID(), holder.getPage()));
+        return s != null ? s.lock : null;
     }
 
-    // ─── Hilfsmethoden & Serialisierung ────────────────────────────────────
+    // ─── Helpers ─────────────────────────────────────────────────────────
 
-    private File getPlayerFile(UUID u) {
-        return new File(userDataFolder, u + ".yml");
-    }
+    private File getPlayerFile(UUID u) { return new File(userDataFolder, u + ".yml"); }
 
     private boolean isNavItem(ItemStack i) {
-        return i != null && i.hasItemMeta() && i.getItemMeta().getPersistentDataContainer().has(navKey, PersistentDataType.STRING);
+        return i != null && i.hasItemMeta()
+                && i.getItemMeta().getPersistentDataContainer().has(navKey, PersistentDataType.STRING);
     }
 
     private ItemStack createNavItem(Material m, String name, String tag) {
@@ -357,71 +480,62 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
         return item;
     }
 
-    public String itemStackArrayToBase64(ItemStack[] items) {
-        try (ByteArrayOutputStream os = new ByteArrayOutputStream();
-             BukkitObjectOutputStream out = new BukkitObjectOutputStream(os)) {
-            out.writeInt(items.length);
-            for (ItemStack item : items) out.writeObject(item);
-            return Base64Coder.encodeLines(os.toByteArray());
-        } catch (Exception e) {
-            return "";
-        }
-    }
-
-    public ItemStack[] itemStackArrayFromBase64(String data) throws Exception {
-        try (ByteArrayInputStream is = new ByteArrayInputStream(Base64Coder.decodeLines(data));
-             BukkitObjectInputStream in = new BukkitObjectInputStream(is)) {
-            int len = in.readInt();
-            ItemStack[] items = new ItemStack[len];
-            for (int i = 0; i < len; i++) items[i] = (ItemStack) in.readObject();
-            return items;
-        }
-    }
-
-    // ─── Sharing-System ───────────────────────────────────────────────────
+    // ─── Sharing ─────────────────────────────────────────────────────────
 
     private void addSharedPlayer(UUID owner, UUID guest) {
-        runAsync(() -> {
-            File f = getPlayerFile(owner);
-            FileConfiguration c = YamlConfiguration.loadConfiguration(f);
-            List<String> list = c.getStringList("shared-with");
-            if (!list.contains(guest.toString())) {
-                list.add(guest.toString());
-                c.set("shared-with", list);
-                try { c.save(f); } catch (IOException ignored) {}
-            }
-        });
+        File f = getPlayerFile(owner);
+        FileConfiguration c = f.exists() ? YamlConfiguration.loadConfiguration(f) : new YamlConfiguration();
+        List<String> list = c.getStringList("shared-with");
+        if (!list.contains(guest.toString())) {
+            list.add(guest.toString());
+            c.set("shared-with", list);
+            try { c.save(f); }
+            catch (IOException ex) { getLogger().warning("Failed to save share for " + owner + ": " + ex.getMessage()); }
+        }
     }
 
     private boolean isSharedWith(UUID owner, UUID guest) {
-        // Synchron, da nur eine kleine Config geladen wird – Aufruf im Async-Context okay
-        return YamlConfiguration.loadConfiguration(getPlayerFile(owner))
+        File f = getPlayerFile(owner);
+        if (!f.exists()) return false;
+        return YamlConfiguration.loadConfiguration(f)
                 .getStringList("shared-with").contains(guest.toString());
     }
 
     private void showSharedList(Player p) {
-        runAsync(() -> {
-            p.sendMessage(Component.text("§eVault-Zugriffe:"));
-            File[] files = userDataFolder.listFiles();
-            if (files == null) return;
-            for (File f : files) {
-                if (YamlConfiguration.loadConfiguration(f).getStringList("shared-with").contains(p.getUniqueId().toString())) {
-                    try {
-                        UUID uuid = UUID.fromString(f.getName().replace(".yml", ""));
-                        @SuppressWarnings("deprecation")
-                        String name = Bukkit.getOfflinePlayer(uuid).getName();
-                        p.sendMessage(Component.text("§7- §f" + (name != null ? name : "Unbekannt")));
-                    } catch (IllegalArgumentException ignored) {}
+        final UUID self = p.getUniqueId();
+        CompletableFuture.runAsync(() -> {
+            List<String> lines = new ArrayList<>();
+            File[] files = userDataFolder.listFiles((dir, name) -> name.endsWith(".yml"));
+            if (files != null) {
+                for (File f : files) {
+                    if (YamlConfiguration.loadConfiguration(f).getStringList("shared-with").contains(self.toString())) {
+                        String base = f.getName().substring(0, f.getName().length() - 4);
+                        try {
+                            UUID uuid = UUID.fromString(base);
+                            String name = Bukkit.getOfflinePlayer(uuid).getName();
+                            lines.add("§7- §f" + (name != null ? name : "Unbekannt"));
+                        } catch (IllegalArgumentException ignored) { /* not a uuid file */ }
+                    }
                 }
             }
-        });
+            runOnPlayer(p, () -> {
+                p.sendMessage(Component.text("§eVault-Zugriffe:"));
+                if (lines.isEmpty()) p.sendMessage(Component.text("§7- (keine)"));
+                else for (String l : lines) p.sendMessage(Component.text(l));
+            });
+        }, asyncExecutor);
     }
 
-    // ─── Tab Completer ────────────────────────────────────────────────────
+    // ─── Tab Completion ──────────────────────────────────────────────────
 
     @Override
     public List<String> onTabComplete(CommandSender s, Command c, String a, String[] args) {
-        if (args.length == 1) return new ArrayList<>(List.of("share", "shared"));
+        if (args.length == 1) {
+            String prefix = args[0].toLowerCase(Locale.ROOT);
+            List<String> out = new ArrayList<>();
+            for (String opt : List.of("share", "shared")) if (opt.startsWith(prefix)) out.add(opt);
+            return out;
+        }
         return null;
     }
 }
