@@ -1,0 +1,9 @@
+name: Vaults
+version: ${version}
+main: com.BreiwalkerSMP.Vaults.Vaults
+api-version: '26.1'
+folia-supported: true
+commands:
+  vault:
+    description: Open or share your vault.
+    usage: /vault [player|share|shared]

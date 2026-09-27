@@ -1,0 +1,4 @@
+vault-settings:
+  title: "&bMy Vault - Site %page%"
+  rows: 6 # 6 Is max
+  total-pages: 2  # with 6 rows and 2 total pages there is a total of 108 items.
