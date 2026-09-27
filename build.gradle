@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'com.BreiwalkerSMP'
-version = '1.8.1'
+version = '2.0-SNAPSHOT-1'
 
 repositories {
     mavenCentral()
