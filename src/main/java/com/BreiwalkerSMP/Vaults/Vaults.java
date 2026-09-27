@@ -1,5 +1,8 @@
 package com.BreiwalkerSMP.Vaults;
 
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import org.bukkit.Bukkit;
@@ -19,6 +22,7 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
@@ -28,10 +32,15 @@ import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.util.io.BukkitObjectInputStream;
 import org.bukkit.util.io.BukkitObjectOutputStream;
 
+import javax.net.ssl.HttpsURLConnection;
+import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
@@ -59,12 +68,16 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
     private NamespacedKey navKey;
     private Executor asyncExecutor;
 
+    // ─── Update checker state ───────────────────────────────────────────
+    private volatile String latestVersion = null;
+    private volatile boolean updateAvailable = false;
+
     // ─── Holder & Session ────────────────────────────────────────────────
 
     public static final class VaultHolder implements InventoryHolder {
         private final UUID ownerUUID;
         private final int page;
-        private Inventory inventory;      // set once created
+        private Inventory inventory;
 
         public VaultHolder(UUID ownerUUID, int page) { this.ownerUUID = ownerUUID; this.page = page; }
         void setInventory(Inventory inv) { this.inventory = inv; }
@@ -89,6 +102,8 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
     @Override
     public void onEnable() {
         saveDefaultConfig();
+        getConfig().options().copyDefaults(true);
+        saveConfig();
 
         userDataFolder = new File(getDataFolder(), "userdata");
         if (!userDataFolder.exists() && !userDataFolder.mkdirs()) {
@@ -112,11 +127,13 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
         }
 
         getServer().getPluginManager().registerEvents(this, this);
+
+        // Start update check
+        checkForUpdates();
     }
 
     @Override
     public void onDisable() {
-        // Synchronously flush every open session so nothing is lost on reload/crash-shutdown.
         for (VaultSession s : sessions.values()) {
             try {
                 String serialised = itemStackArrayToBase64(snapshot(s.inventory));
@@ -128,6 +145,103 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
         sessions.clear();
         loadingFutures.clear();
         pendingSaves.clear();
+    }
+
+    // ─── Update Checker ──────────────────────────────────────────────────
+
+    private void checkForUpdates() {
+        if (!getConfig().getBoolean("update-checker.enabled", true)) return;
+
+        CompletableFuture.runAsync(() -> {
+            try {
+                URL url = new URL("https://api.modrinth.com/v2/project/vaults/version");
+                HttpsURLConnection con = (HttpsURLConnection) url.openConnection();
+                con.setRequestMethod("GET");
+                con.setRequestProperty("User-Agent", "Vaults/" + getDescription().getVersion());
+                con.setConnectTimeout(5000);
+                con.setReadTimeout(5000);
+
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(con.getInputStream(), StandardCharsets.UTF_8))) {
+                    JsonArray array = new Gson().fromJson(reader, JsonArray.class);
+                    if (array != null && array.size() > 0) {
+                        JsonObject latest = array.get(0).getAsJsonObject();
+                        latestVersion = latest.get("version_number").getAsString();
+                        updateAvailable = isNewerVersion(getDescription().getVersion(), latestVersion);
+                    }
+                }
+            } catch (Exception ex) {
+                getLogger().warning("Failed to check for updates: " + ex.getMessage());
+                return;
+            }
+
+            if (updateAvailable && getConfig().getBoolean("update-checker.notify-console", true)) {
+                getLogger().info("§eA new version of Vaults is available: §f" + latestVersion
+                        + " §7(you have " + getDescription().getVersion() + ")");
+                getLogger().info("§7Download: §bhttps://modrinth.com/plugin/vaults");
+            }
+        }, asyncExecutor);
+    }
+
+    private boolean isNewerVersion(String current, String latest) {
+        int[] cur = parseVersion(current);
+        int[] lat = parseVersion(latest);
+        int max = Math.max(cur.length, lat.length);
+        for (int i = 0; i < max; i++) {
+            int c = i < cur.length ? cur[i] : 0;
+            int l = i < lat.length ? lat[i] : 0;
+            if (l > c) return true;
+            if (l < c) return false;
+        }
+        return false;
+    }
+
+    private int[] parseVersion(String v) {
+        if (v == null) return new int[]{0};
+        String clean = v.replaceAll("^[vV]", "").split("[-+]")[0];
+        String[] parts = clean.split("\\.");
+        int[] result = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) {
+            try { result[i] = Integer.parseInt(parts[i].replaceAll("[^0-9]", "")); }
+            catch (NumberFormatException e) { result[i] = 0; }
+        }
+        return result;
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onJoin(PlayerJoinEvent e) {
+        if (!updateAvailable) return;
+        if (!getConfig().getBoolean("update-checker.notify-ops-on-join", true)) return;
+
+        Player p = e.getPlayer();
+        String perm = getConfig().getString("update-checker.notify-permission", "vaults.update");
+        if (!p.isOp() && !p.hasPermission(perm)) return;
+
+        runOnPlayer(p, () -> {
+            p.sendMessage(msg("update-available",
+                    "%version%", latestVersion,
+                    "%current%", getDescription().getVersion()));
+            p.sendMessage(rawMsg("update-download"));
+        });
+    }
+
+    // ─── Message helpers ─────────────────────────────────────────────────
+
+    private Component msg(String key, String... replacements) {
+        String prefix = getConfig().getString("messages.prefix", "");
+        String raw = getConfig().getString("messages." + key, key);
+        for (int i = 0; i < replacements.length; i += 2) {
+            raw = raw.replace(replacements[i], replacements[i + 1]);
+        }
+        return LegacyComponentSerializer.legacySection().deserialize(prefix + raw);
+    }
+
+    private Component rawMsg(String key, String... replacements) {
+        String raw = getConfig().getString("messages." + key, key);
+        for (int i = 0; i < replacements.length; i += 2) {
+            raw = raw.replace(replacements[i], replacements[i + 1]);
+        }
+        return LegacyComponentSerializer.legacySection().deserialize(raw);
     }
 
     // ─── Threading helpers ───────────────────────────────────────────────
@@ -177,11 +291,12 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
                 CompletableFuture.runAsync(() -> {
                     Player target = Bukkit.getPlayerExact(targetName);
                     if (target == null) {
-                        runOnPlayer(player, () -> player.sendMessage(Component.text("§cSpieler offline.")));
+                        runOnPlayer(player, () -> player.sendMessage(msg("player-offline")));
                         return;
                     }
                     addSharedPlayer(self, target.getUniqueId());
-                    runOnPlayer(player, () -> player.sendMessage(Component.text("§aVault geteilt mit §e" + target.getName())));
+                    runOnPlayer(player, () -> player.sendMessage(
+                            msg("vault-shared", "%player%", target.getName())));
                 }, asyncExecutor);
                 return true;
             }
@@ -195,7 +310,7 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
                 if (allowed) {
                     runOnPlayer(player, () -> openVault(player, 1, targetUUID));
                 } else {
-                    runOnPlayer(player, () -> player.sendMessage(Component.text("§cKeine Berechtigung.")));
+                    runOnPlayer(player, () -> player.sendMessage(msg("no-permission")));
                 }
             }, asyncExecutor);
             return true;
@@ -265,7 +380,7 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
         }).exceptionally(ex -> {
             getLogger().warning("Failed to load vault " + cacheKey + ": " + ex);
             if (player.isOnline()) {
-                runOnPlayer(player, () -> player.sendMessage(Component.text("§cVault konnte nicht geladen werden.")));
+                runOnPlayer(player, () -> player.sendMessage(msg("vault-load-failed")));
             }
             return null;
         });
@@ -278,9 +393,9 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
             Inventory inv = session.inventory;
             int size = inv.getSize();
             inv.setItem(size - 1, session.page < totalPages
-                    ? createNavItem(Material.ARROW, "§eNext →", "next") : null);
+                    ? createNavItem(Material.ARROW, rawMsg("nav-next"), "next") : null);
             inv.setItem(size - 9, session.page > 1
-                    ? createNavItem(Material.ARROW, "§e← Prev", "prev") : null);
+                    ? createNavItem(Material.ARROW, rawMsg("nav-prev"), "prev") : null);
         } finally {
             lock.unlock();
         }
@@ -313,7 +428,6 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
         return out;
     }
 
-    /** Capture a snapshot and enqueue a chained, ordered save. */
     private void saveVaultContent(UUID ownerUUID, int page, Inventory inv) {
         final String cacheKey = key(ownerUUID, page);
 
@@ -328,7 +442,6 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
         }
         final ItemStack[] finalSnap = snap;
 
-        // Chain so newer saves always run after older ones (never out of order).
         CompletableFuture<Void> prev = pendingSaves.getOrDefault(cacheKey, CompletableFuture.completedFuture(null));
         CompletableFuture<Void> chained = prev.thenRunAsync(() -> {
             try {
@@ -352,7 +465,6 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
         cfg.save(f);
     }
 
-    /** Evict cache only when no viewers AND no pending save — prevents stale-reload dupes. */
     private void tryEvict(String cacheKey) {
         Runnable check = () -> {
             VaultSession s = sessions.get(cacheKey);
@@ -379,7 +491,6 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
     }
 
     public ItemStack[] itemStackArrayFromBase64(String data) throws Exception {
-        // MIME decoder tolerates both old line-wrapped Base64Coder output and new single-line data.
         byte[] bytes = Base64.getMimeDecoder().decode(data);
         try (ByteArrayInputStream is = new ByteArrayInputStream(bytes);
              BukkitObjectInputStream in = new BukkitObjectInputStream(is)) {
@@ -402,7 +513,6 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
             int slot = e.getRawSlot();
             int size = e.getInventory().getSize();
 
-            // Navigation slots
             if (slot == size - 1 || slot == size - 9) {
                 e.setCancelled(true);
                 ItemStack clicked = e.getCurrentItem();
@@ -411,14 +521,12 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
                             .get(navKey, PersistentDataType.STRING);
                     if (nav != null) {
                         int nextPage = holder.getPage() + ("next".equals(nav) ? 1 : -1);
-                        // Defer so we don't reenter while holding the lock.
                         runOnPlayer(p, () -> openVault(p, nextPage, holder.getOwnerUUID()));
                     }
                 }
                 return;
             }
 
-            // Defensive: any nav item outside the nav slots must not be movable.
             if (e.getCurrentItem() != null && isNavItem(e.getCurrentItem())) {
                 e.setCancelled(true);
                 e.setCurrentItem(null);
@@ -471,10 +579,10 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
                 && i.getItemMeta().getPersistentDataContainer().has(navKey, PersistentDataType.STRING);
     }
 
-    private ItemStack createNavItem(Material m, String name, String tag) {
+    private ItemStack createNavItem(Material m, Component name, String tag) {
         ItemStack item = new ItemStack(m);
         ItemMeta meta = item.getItemMeta();
-        meta.displayName(LegacyComponentSerializer.legacySection().deserialize(name));
+        meta.displayName(name);
         meta.getPersistentDataContainer().set(navKey, PersistentDataType.STRING, tag);
         item.setItemMeta(meta);
         return item;
@@ -513,15 +621,16 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
                         try {
                             UUID uuid = UUID.fromString(base);
                             String name = Bukkit.getOfflinePlayer(uuid).getName();
-                            lines.add("§7- §f" + (name != null ? name : "Unbekannt"));
+                            lines.add(getConfig().getString("messages.shared-list-entry", "&7- &f%player%")
+                                    .replace("%player%", name != null ? name : "Unknown"));
                         } catch (IllegalArgumentException ignored) { /* not a uuid file */ }
                     }
                 }
             }
             runOnPlayer(p, () -> {
-                p.sendMessage(Component.text("§eVault-Zugriffe:"));
-                if (lines.isEmpty()) p.sendMessage(Component.text("§7- (keine)"));
-                else for (String l : lines) p.sendMessage(Component.text(l));
+                p.sendMessage(msg("shared-list-header"));
+                if (lines.isEmpty()) p.sendMessage(msg("shared-list-empty"));
+                else for (String l : lines) p.sendMessage(LegacyComponentSerializer.legacySection().deserialize(l));
             });
         }, asyncExecutor);
     }

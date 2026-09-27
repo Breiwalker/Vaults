@@ -1,4 +1,44 @@
+# ─── Vault Settings ──────────────────────────────────────────────────────
 vault-settings:
-  title: "&bMy Vault - Site %page%"
-  rows: 6 # 6 Is max
-  total-pages: 2  # with 6 rows and 2 total pages there is a total of 108 items.
+  # Number of rows per vault page (1-6)
+  rows: 6
+  # Total number of pages per vault
+  total-pages: 2
+  # Title shown when opening a vault. %page% = current page number
+  title: "Vault %page%"
+
+# ─── Update Checker ──────────────────────────────────────────────────────
+update-checker:
+  # Enable/disable the Modrinth update checker entirely
+  enabled: true
+  # Log an update notice to the console when one is found
+  notify-console: true
+  # Notify players with permission (or OP) when they join
+  notify-ops-on-join: true
+  # Permission node required to receive join notifications
+  notify-permission: "vaults.update"
+
+# ─── Messages ────────────────────────────────────────────────────────────
+# All messages use legacy color codes (&a, &c, etc.).
+# The prefix is prepended to every chat message (leave empty for none).
+messages:
+  prefix: "&8[&6Vaults&8] "
+
+  # Chat messages
+  player-offline: "&cPlayer is offline."
+  vault-shared: "&aVault shared with &e%player%"
+  no-permission: "&cYou don't have permission."
+  vault-load-failed: "&cFailed to load vault. Please try again."
+
+  # Shared list
+  shared-list-header: "&eVault access:"
+  shared-list-entry: "&7- &f%player%"
+  shared-list-empty: "&7- (none)"
+
+  # Navigation buttons (these do NOT get the prefix)
+  nav-next: "&eNext →"
+  nav-prev: "&e← Prev"
+
+  # Update checker
+  update-available: "&eA new version of Vaults is available: &f%version% &7(you have %current%)"
+  update-download: "&7Download: &bhttps://modrinth.com/plugin/vaults"
