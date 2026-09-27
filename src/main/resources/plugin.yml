@@ -3,6 +3,7 @@ version: ${version}
 main: com.BreiwalkerSMP.Vaults.Vaults
 api-version: '1.21.5'
 authors: [Breiwalker]
+folia-supported: true
 
 libraries:
   - org.xerial:sqlite-jdbc:3.46.0.0
