@@ -1,10 +1,11 @@
 plugins {
     id 'java'
     id("xyz.jpenilla.run-paper") version "2.3.1"
+    id("com.gradleup.shadow") version "8.3.0"
 }
 
 group = 'com.BreiwalkerSMP'
-version = '2.0-SNAPSHOT-1'
+version = '2.0-SNAPSHOT-2'
 
 repositories {
     mavenCentral()
@@ -17,11 +18,24 @@ repositories {
 dependencies {
     compileOnly("io.papermc.paper:paper-api:1.21.11-R0.1-SNAPSHOT")
     implementation("org.bstats:bstats-bukkit:3.1.0")
+    compileOnly("org.xerial:sqlite-jdbc:3.46.0.0")
 }
 
 tasks.named("runServer") {
-    // Falls du das run-paper Plugin nutzt
-    setProperty("minecraftVersion", "1.21.1")
+    minecraftVersion = "1.21.11"
+}
+
+tasks.named("shadowJar") {
+    archiveClassifier.set("")
+    relocate("org.bstats", "com.BreiwalkerSMP.Vaults.libs.bstats")
+}
+
+tasks.named("jar") {
+    enabled = false
+}
+
+tasks.named("build") {
+    dependsOn(tasks.named("shadowJar"))
 }
 
 def targetJavaVersion = 21

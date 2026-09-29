@@ -28,7 +28,9 @@ import java.util.logging.Logger;
  *   <li>A single {@link Connection} is held open for the plugin's lifetime, protected by
  *       {@link #lock}. SQLite serializes writes internally anyway; this just prevents
  *       interleaving of multi-statement operations.</li>
- *   <li>WAL mode is enabled so reads don't block writes and vice-versa.</li>
+ *   <li>WAL mode is enabled so readers and writers don't block each other.</li>
+ *   <li>Schema changes are handled by a versioned migration system driven by SQLite's
+ *       {@code PRAGMA user_version}. Each migration runs atomically in a transaction.</li>
  *   <li>All public methods are safe to call from any thread.</li>
  * </ul>
  */
@@ -49,47 +51,24 @@ public final class DatabaseManager {
         this.yamlFolder = yamlFolder;
     }
 
-    // ─── Lifecycle ───────────────────────────────────────────────────────
+    // ─── Schema migrations ───────────────────────────────────────────────
+    //
+    // The list index is the target version. To change the schema, append a new
+    // migration at the END of the list — never modify an existing entry, since
+    // already-migrated databases will not re-run it.
 
-    public synchronized void open() throws SQLException {
-        if (connection != null && !connection.isClosed()) return;
-
-        // Ensure driver is on the classpath before opening.
-        try { Class.forName("org.sqlite.JDBC"); }
-        catch (ClassNotFoundException e) {
-            throw new SQLException("SQLite JDBC driver not found. Add it via 'libraries:' in plugin.yml.", e);
-        }
-
-        if (!dbFile.getParentFile().exists() && !dbFile.getParentFile().mkdirs()) {
-            throw new SQLException("Could not create plugin data folder: " + dbFile.getParentFile());
-        }
-
-        connection = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
-        try (Statement st = connection.createStatement()) {
-            st.execute("PRAGMA journal_mode=WAL");
-            st.execute("PRAGMA synchronous=NORMAL");
-            st.execute("PRAGMA foreign_keys=ON");
-            st.execute("PRAGMA busy_timeout=5000");
-        }
-        createSchema();
+    @FunctionalInterface
+    private interface Migration {
+        void apply(Connection c) throws SQLException;
     }
 
-    public synchronized void close() {
-        if (connection == null) return;
-        try {
-            try (Statement st = connection.createStatement()) {
-                st.execute("PRAGMA wal_checkpoint(TRUNCATE)");
-            }
-            connection.close();
-        } catch (SQLException ex) {
-            log.warning("Error closing database: " + ex.getMessage());
-        } finally {
-            connection = null;
-        }
-    }
+    private static final List<Migration> MIGRATIONS = List.of(
+            DatabaseManager::migrateV1
+    );
 
-    private void createSchema() throws SQLException {
-        try (Statement st = connection.createStatement()) {
+    /** v1 — initial schema. */
+    private static void migrateV1(Connection c) throws SQLException {
+        try (Statement st = c.createStatement()) {
             st.execute("""
                 CREATE TABLE IF NOT EXISTS vault_pages (
                     owner_uuid TEXT    NOT NULL,
@@ -113,6 +92,104 @@ public final class DatabaseManager {
                     value TEXT NOT NULL
                 )
             """);
+            st.execute("CREATE INDEX IF NOT EXISTS idx_vault_shares_guest ON vault_shares(guest_uuid)");
+        }
+    }
+
+    // ─── Lifecycle ───────────────────────────────────────────────────────
+
+    public void open() throws SQLException {
+        lock.lock();
+        try {
+            if (connection != null && !connection.isClosed()) return;
+
+            // Ensure driver is on the classpath before opening.
+            try { Class.forName("org.sqlite.JDBC"); }
+            catch (ClassNotFoundException e) {
+                throw new SQLException("SQLite JDBC driver not found. Add it via 'libraries:' in plugin.yml.", e);
+            }
+
+            if (!dbFile.getParentFile().exists() && !dbFile.getParentFile().mkdirs()) {
+                throw new SQLException("Could not create plugin data folder: " + dbFile.getParentFile());
+            }
+
+            connection = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
+            try {
+                try (Statement st = connection.createStatement()) {
+                    st.execute("PRAGMA journal_mode=WAL");
+                    st.execute("PRAGMA synchronous=NORMAL");
+                    st.execute("PRAGMA foreign_keys=ON");
+                    st.execute("PRAGMA busy_timeout=5000");
+                }
+                runMigrations();
+            } catch (SQLException ex) {
+                try { connection.close(); } catch (SQLException ignored) { }
+                connection = null;
+                throw ex;
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public void close() {
+        lock.lock();
+        try {
+            if (connection == null) return;
+            try {
+                try (Statement st = connection.createStatement()) {
+                    st.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+                }
+                connection.close();
+            } catch (SQLException ex) {
+                log.warning("Error closing database: " + ex.getMessage());
+            } finally {
+                connection = null;
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void runMigrations() throws SQLException {
+        int current = getUserVersion();
+        int target = MIGRATIONS.size();
+
+        if (current > target) {
+            log.warning("Database schema version " + current
+                    + " is newer than the supported version " + target
+                    + ". The plugin may not work correctly.");
+            return;
+        }
+
+        for (int v = current; v < target; v++) {
+            int next = v + 1;
+            try {
+                connection.setAutoCommit(false);
+                try {
+                    MIGRATIONS.get(v).apply(connection);
+                    try (Statement st = connection.createStatement()) {
+                        st.execute("PRAGMA user_version = " + next);
+                    }
+                    connection.commit();
+                    log.info("Applied database migration v" + next);
+                } catch (SQLException ex) {
+                    connection.rollback();
+                    throw ex;
+                } finally {
+                    connection.setAutoCommit(true);
+                }
+            } catch (SQLException ex) {
+                log.severe("Failed to apply database migration v" + next + ": " + ex.getMessage());
+                throw ex;
+            }
+        }
+    }
+
+    private int getUserVersion() throws SQLException {
+        try (Statement st = connection.createStatement();
+             ResultSet rs = st.executeQuery("PRAGMA user_version")) {
+            return rs.next() ? rs.getInt(1) : 0;
         }
     }
 
@@ -121,12 +198,15 @@ public final class DatabaseManager {
     /** Returns raw serialized bytes, or {@code null} if the page has never been saved. */
     public byte[] loadPage(UUID owner, int page) {
         lock.lock();
-        try (PreparedStatement ps = connection.prepareStatement(
-                "SELECT data FROM vault_pages WHERE owner_uuid = ? AND page = ?")) {
-            ps.setString(1, owner.toString());
-            ps.setInt(2, page);
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() ? rs.getBytes("data") : null;
+        try {
+            if (connection == null) return null;
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT data FROM vault_pages WHERE owner_uuid = ? AND page = ?")) {
+                ps.setString(1, owner.toString());
+                ps.setInt(2, page);
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? rs.getBytes("data") : null;
+                }
             }
         } catch (SQLException ex) {
             log.warning("loadPage failed for " + owner + " p" + page + ": " + ex.getMessage());
@@ -138,18 +218,24 @@ public final class DatabaseManager {
 
     public void savePage(UUID owner, int page, byte[] data) {
         lock.lock();
-        try (PreparedStatement ps = connection.prepareStatement("""
-                INSERT INTO vault_pages (owner_uuid, page, data, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(owner_uuid, page) DO UPDATE SET
-                    data = excluded.data,
-                    updated_at = excluded.updated_at
-                """)) {
-            ps.setString(1, owner.toString());
-            ps.setInt(2, page);
-            ps.setBytes(3, data);
-            ps.setLong(4, System.currentTimeMillis());
-            ps.executeUpdate();
+        try {
+            if (connection == null) {
+                log.warning("savePage skipped for " + owner + " p" + page + ": database not open.");
+                return;
+            }
+            try (PreparedStatement ps = connection.prepareStatement("""
+                    INSERT INTO vault_pages (owner_uuid, page, data, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(owner_uuid, page) DO UPDATE SET
+                        data = excluded.data,
+                        updated_at = excluded.updated_at
+                    """)) {
+                ps.setString(1, owner.toString());
+                ps.setInt(2, page);
+                ps.setBytes(3, data);
+                ps.setLong(4, System.currentTimeMillis());
+                ps.executeUpdate();
+            }
         } catch (SQLException ex) {
             log.warning("savePage failed for " + owner + " p" + page + ": " + ex.getMessage());
         } finally {
@@ -161,14 +247,20 @@ public final class DatabaseManager {
 
     public void addShare(UUID owner, UUID guest) {
         lock.lock();
-        try (PreparedStatement ps = connection.prepareStatement("""
-                INSERT OR IGNORE INTO vault_shares (owner_uuid, guest_uuid, created_at)
-                VALUES (?, ?, ?)
-                """)) {
-            ps.setString(1, owner.toString());
-            ps.setString(2, guest.toString());
-            ps.setLong(3, System.currentTimeMillis());
-            ps.executeUpdate();
+        try {
+            if (connection == null) {
+                log.warning("addShare skipped: database not open.");
+                return;
+            }
+            try (PreparedStatement ps = connection.prepareStatement("""
+                    INSERT OR IGNORE INTO vault_shares (owner_uuid, guest_uuid, created_at)
+                    VALUES (?, ?, ?)
+                    """)) {
+                ps.setString(1, owner.toString());
+                ps.setString(2, guest.toString());
+                ps.setLong(3, System.currentTimeMillis());
+                ps.executeUpdate();
+            }
         } catch (SQLException ex) {
             log.warning("addShare failed: " + ex.getMessage());
         } finally {
@@ -178,12 +270,15 @@ public final class DatabaseManager {
 
     public boolean isSharedWith(UUID owner, UUID guest) {
         lock.lock();
-        try (PreparedStatement ps = connection.prepareStatement(
-                "SELECT 1 FROM vault_shares WHERE owner_uuid = ? AND guest_uuid = ? LIMIT 1")) {
-            ps.setString(1, owner.toString());
-            ps.setString(2, guest.toString());
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next();
+        try {
+            if (connection == null) return false;
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT 1 FROM vault_shares WHERE owner_uuid = ? AND guest_uuid = ? LIMIT 1")) {
+                ps.setString(1, owner.toString());
+                ps.setString(2, guest.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next();
+                }
             }
         } catch (SQLException ex) {
             log.warning("isSharedWith failed: " + ex.getMessage());
@@ -197,13 +292,16 @@ public final class DatabaseManager {
     public List<UUID> ownersSharingWith(UUID guest) {
         List<UUID> out = new ArrayList<>();
         lock.lock();
-        try (PreparedStatement ps = connection.prepareStatement(
-                "SELECT owner_uuid FROM vault_shares WHERE guest_uuid = ?")) {
-            ps.setString(1, guest.toString());
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    try { out.add(UUID.fromString(rs.getString("owner_uuid"))); }
-                    catch (IllegalArgumentException ignored) { /* skip malformed */ }
+        try {
+            if (connection == null) return out;
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT owner_uuid FROM vault_shares WHERE guest_uuid = ?")) {
+                ps.setString(1, guest.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        try { out.add(UUID.fromString(rs.getString("owner_uuid"))); }
+                        catch (IllegalArgumentException ignored) { /* skip malformed */ }
+                    }
                 }
             }
         } catch (SQLException ex) {
@@ -218,11 +316,14 @@ public final class DatabaseManager {
 
     public String getMeta(String key) {
         lock.lock();
-        try (PreparedStatement ps = connection.prepareStatement(
-                "SELECT value FROM meta WHERE key = ?")) {
-            ps.setString(1, key);
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() ? rs.getString("value") : null;
+        try {
+            if (connection == null) return null;
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT value FROM meta WHERE key = ?")) {
+                ps.setString(1, key);
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? rs.getString("value") : null;
+                }
             }
         } catch (SQLException ex) {
             return null;
@@ -233,13 +334,16 @@ public final class DatabaseManager {
 
     public void setMeta(String key, String value) {
         lock.lock();
-        try (PreparedStatement ps = connection.prepareStatement("""
-                INSERT INTO meta (key, value) VALUES (?, ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                """)) {
-            ps.setString(1, key);
-            ps.setString(2, value);
-            ps.executeUpdate();
+        try {
+            if (connection == null) return;
+            try (PreparedStatement ps = connection.prepareStatement("""
+                    INSERT INTO meta (key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """)) {
+                ps.setString(1, key);
+                ps.setString(2, value);
+                ps.executeUpdate();
+            }
         } catch (SQLException ex) {
             log.warning("setMeta failed: " + ex.getMessage());
         } finally {

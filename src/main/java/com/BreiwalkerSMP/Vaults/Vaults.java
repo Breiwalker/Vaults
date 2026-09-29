@@ -14,6 +14,7 @@ import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.TabCompleter;
 import org.bukkit.entity.Player;
+import org.bukkit.OfflinePlayer;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
@@ -47,6 +48,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
 public class Vaults extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
@@ -61,6 +63,7 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
     private NamespacedKey navKey;
     private Executor asyncExecutor;
     private DatabaseManager db;
+    private volatile CompletableFuture<Void> dbInitFuture;
 
     private volatile String latestVersion = null;
     private volatile boolean updateAvailable = false;
@@ -107,7 +110,7 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
         File yamlDir   = new File(getDataFolder(), "userdata");
         db = new DatabaseManager(getLogger(), dbFile, yamlDir);
 
-        CompletableFuture.runAsync(() -> {
+        dbInitFuture = CompletableFuture.runAsync(() -> {
             try {
                 db.open();
                 db.migrateFromYamlIfNeeded();
@@ -131,6 +134,12 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
 
     @Override
     public void onDisable() {
+        // Wait for the async DB init to settle so we never close after it opens.
+        if (dbInitFuture != null) {
+            try { dbInitFuture.get(10, TimeUnit.SECONDS); }
+            catch (Exception ignored) { }
+        }
+
         // Synchronously flush every open session so nothing is lost on reload/crash-shutdown.
         for (VaultSession s : sessions.values()) {
             try {
@@ -142,7 +151,14 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
         }
         sessions.clear();
         loadingFutures.clear();
+
+        // Drain any in-flight async saves before closing the connection.
+        for (CompletableFuture<Void> pending : pendingSaves.values()) {
+            try { pending.get(5, TimeUnit.SECONDS); }
+            catch (Exception ignored) { }
+        }
         pendingSaves.clear();
+
         if (db != null) db.close();
     }
 
@@ -288,7 +304,12 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
 
             final String lookupName = args[0];
             CompletableFuture.runAsync(() -> {
-                UUID targetUUID = Bukkit.getOfflinePlayer(lookupName).getUniqueId();
+                OfflinePlayer target = Bukkit.getOfflinePlayer(lookupName);
+                if (!target.hasPlayedBefore()) {
+                    runOnPlayer(player, () -> player.sendMessage(msg("player-offline")));
+                    return;
+                }
+                UUID targetUUID = target.getUniqueId();
                 boolean allowed = player.isOp()
                         || player.hasPermission("vaults.admin")
                         || db.isSharedWith(targetUUID, player.getUniqueId());
@@ -318,33 +339,33 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
         VaultSession cached = sessions.get(cacheKey);
         if (cached != null) { openSession(player, cached, totalPages); return; }
 
-        CompletableFuture<VaultSession> future = loadingFutures.get(cacheKey);
-        if (future == null) {
-            CompletableFuture<ItemStack[]> loadFuture = CompletableFuture.supplyAsync(
-                    () -> loadItems(targetUUID, page), asyncExecutor);
-
+        CompletableFuture<VaultSession> future = loadingFutures.computeIfAbsent(cacheKey, k -> {
             CompletableFuture<VaultSession> created = new CompletableFuture<>();
-            loadFuture.thenAccept(items -> runOnMain(() -> {
-                try {
-                    VaultHolder holder = new VaultHolder(targetUUID, page);
-                    Inventory inv = Bukkit.createInventory(holder, rows * 9, title);
-                    holder.setInventory(inv);
-                    int max = Math.min(items.length, inv.getSize());
-                    for (int i = 0; i < max; i++) {
-                        ItemStack it = items[i];
-                        if (it != null && !isNavItem(it)) inv.setItem(i, it);
-                    }
-                    created.complete(new VaultSession(targetUUID, page, inv));
-                } catch (Throwable t) { created.completeExceptionally(t); }
-            }));
-
-            CompletableFuture<VaultSession> existing = loadingFutures.putIfAbsent(cacheKey, created);
-            if (existing != null) future = existing;
-            else {
-                future = created;
-                created.whenComplete((s, ex) -> loadingFutures.remove(cacheKey, created));
-            }
-        }
+            CompletableFuture.supplyAsync(() -> loadItems(targetUUID, page), asyncExecutor)
+                    .whenComplete((items, ex) -> {
+                        if (ex != null) {
+                            created.completeExceptionally(ex);
+                            return;
+                        }
+                        runOnMain(() -> {
+                            try {
+                                VaultHolder holder = new VaultHolder(targetUUID, page);
+                                Inventory inv = Bukkit.createInventory(holder, rows * 9, title);
+                                holder.setInventory(inv);
+                                int max = Math.min(items.length, inv.getSize());
+                                for (int i = 0; i < max; i++) {
+                                    ItemStack it = items[i];
+                                    if (it != null && !isNavItem(it)) inv.setItem(i, it);
+                                }
+                                created.complete(new VaultSession(targetUUID, page, inv));
+                            } catch (Throwable t) {
+                                created.completeExceptionally(t);
+                            }
+                        });
+                    });
+            created.whenComplete((s, ex) -> loadingFutures.remove(cacheKey, created));
+            return created;
+        });
 
         future.thenAccept(session -> {
             sessions.putIfAbsent(cacheKey, session);
