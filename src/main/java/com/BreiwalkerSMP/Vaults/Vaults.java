@@ -1,8 +1,5 @@
 package com.BreiwalkerSMP.Vaults;
 
-import com.google.gson.Gson;
-import com.google.gson.JsonArray;
-import com.google.gson.JsonObject;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import org.bukkit.Bukkit;
@@ -31,14 +28,9 @@ import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.util.io.BukkitObjectInputStream;
 import org.bukkit.util.io.BukkitObjectOutputStream;
 
-import javax.net.ssl.HttpsURLConnection;
-import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.InputStreamReader;
-import java.net.URL;
-import java.nio.charset.StandardCharsets;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
@@ -95,7 +87,7 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
     public void onEnable() {
         saveDefaultConfig();
         getConfig().options().copyDefaults(true);
-        saveConfig();
+        ConfigMigrator.migrate(this);
 
         navKey = new NamespacedKey(this, "nav");
 
@@ -162,61 +154,35 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
         if (db != null) db.close();
     }
 
-    // ─── Update checker (unchanged — kept identical to previous version) ─
-    // checkForUpdates(), isNewerVersion(), parseVersion(), onJoin() … unchanged.
+    // ─── Update checker ──────────────────────────────────────────────────
 
     private void checkForUpdates() {
         if (!getConfig().getBoolean("update-checker.enabled", true)) return;
         CompletableFuture.runAsync(() -> {
-            try {
-                URL url = new URL("https://api.modrinth.com/v2/project/vaults/version");
-                HttpsURLConnection con = (HttpsURLConnection) url.openConnection();
-                con.setRequestMethod("GET");
-                con.setRequestProperty("User-Agent", "Vaults/" + getDescription().getVersion());
-                con.setConnectTimeout(5000);
-                con.setReadTimeout(5000);
-                try (BufferedReader reader = new BufferedReader(
-                        new InputStreamReader(con.getInputStream(), StandardCharsets.UTF_8))) {
-                    JsonArray array = new Gson().fromJson(reader, JsonArray.class);
-                    if (array != null && array.size() > 0) {
-                        JsonObject latest = array.get(0).getAsJsonObject();
-                        latestVersion = latest.get("version_number").getAsString();
-                        updateAvailable = isNewerVersion(getDescription().getVersion(), latestVersion);
-                    }
-                }
-            } catch (Exception ex) {
-                getLogger().warning("Failed to check for updates: " + ex.getMessage());
-                return;
-            }
-            if (updateAvailable && getConfig().getBoolean("update-checker.notify-console", true)) {
-                getLogger().info("§eA new version of Vaults is available: §f" + latestVersion
+            String channel = getConfig().getString("update-checker.channel", "release");
+            UpdateChecker checker = new UpdateChecker(getLogger(), getDescription().getVersion(),
+                    serverMinecraftVersion(), channel);
+            String newVersion = checker.check();
+            if (newVersion == null) return;
+
+            latestVersion = newVersion;
+            updateAvailable = true;
+
+            if (getConfig().getBoolean("update-checker.notify-console", true)) {
+                getLogger().info("§eA new version of Vaults is available: §f" + newVersion
                         + " §7(you have " + getDescription().getVersion() + ")");
                 getLogger().info("§7Download: §bhttps://modrinth.com/plugin/vaults");
             }
         }, asyncExecutor);
     }
 
-    private boolean isNewerVersion(String current, String latest) {
-        int[] cur = parseVersion(current), lat = parseVersion(latest);
-        int max = Math.max(cur.length, lat.length);
-        for (int i = 0; i < max; i++) {
-            int c = i < cur.length ? cur[i] : 0, l = i < lat.length ? lat[i] : 0;
-            if (l > c) return true;
-            if (l < c) return false;
+    private String serverMinecraftVersion() {
+        try {
+            String v = Bukkit.getMinecraftVersion();
+            return v != null ? v : "";
+        } catch (Throwable t) {
+            return "";
         }
-        return false;
-    }
-
-    private int[] parseVersion(String v) {
-        if (v == null) return new int[]{0};
-        String clean = v.replaceAll("^[vV]", "").split("[-+]")[0];
-        String[] parts = clean.split("\\.");
-        int[] result = new int[parts.length];
-        for (int i = 0; i < parts.length; i++) {
-            try { result[i] = Integer.parseInt(parts[i].replaceAll("[^0-9]", "")); }
-            catch (NumberFormatException e) { result[i] = 0; }
-        }
-        return result;
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
