@@ -2,8 +2,20 @@ name: Vaults
 version: ${version}
 main: com.BreiwalkerSMP.Vaults.Vaults
 api-version: '1.21.5'
+authors: [Breiwalker]
 folia-supported: true
+
+libraries:
+  - org.xerial:sqlite-jdbc:3.46.0.0
+
 commands:
   vault:
-    description: Open or share your vault.
-    usage: /vault [player|share|shared]
+    description: Open your vault
+    usage: /vault [share|shared|<player>]
+permissions:
+  vaults.admin:
+    description: Open any player's vault
+    default: op
+  vaults.update:
+    description: Receive update notifications
+    default: op
