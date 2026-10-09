@@ -312,6 +312,127 @@ public final class DatabaseManager {
         return out;
     }
 
+    /** Revokes {@code guest}'s access to {@code owner}'s vault. Returns whether a row was removed. */
+    public boolean removeShare(UUID owner, UUID guest) {
+        lock.lock();
+        try {
+            if (connection == null) return false;
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "DELETE FROM vault_shares WHERE owner_uuid = ? AND guest_uuid = ?")) {
+                ps.setString(1, owner.toString());
+                ps.setString(2, guest.toString());
+                return ps.executeUpdate() > 0;
+            }
+        } catch (SQLException ex) {
+            log.warning("removeShare failed: " + ex.getMessage());
+            return false;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Returns every guest UUID whose owner has shared their vault with them. */
+    public List<UUID> guestsOf(UUID owner) {
+        List<UUID> out = new ArrayList<>();
+        lock.lock();
+        try {
+            if (connection == null) return out;
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT guest_uuid FROM vault_shares WHERE owner_uuid = ?")) {
+                ps.setString(1, owner.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        try { out.add(UUID.fromString(rs.getString("guest_uuid"))); }
+                        catch (IllegalArgumentException ignored) { /* skip malformed */ }
+                    }
+                }
+            }
+        } catch (SQLException ex) {
+            log.warning("guestsOf failed: " + ex.getMessage());
+        } finally {
+            lock.unlock();
+        }
+        return out;
+    }
+
+    // ─── Page administration ─────────────────────────────────────────────
+
+    /** Deletes a single page row for {@code owner}, if present. */
+    public void deletePage(UUID owner, int page) {
+        lock.lock();
+        try {
+            if (connection == null) return;
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "DELETE FROM vault_pages WHERE owner_uuid = ? AND page = ?")) {
+                ps.setString(1, owner.toString());
+                ps.setInt(2, page);
+                ps.executeUpdate();
+            }
+        } catch (SQLException ex) {
+            log.warning("deletePage failed: " + ex.getMessage());
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Deletes every page row for {@code owner}. Returns the number of rows deleted. */
+    public int deleteAllPages(UUID owner) {
+        lock.lock();
+        try {
+            if (connection == null) return 0;
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "DELETE FROM vault_pages WHERE owner_uuid = ?")) {
+                ps.setString(1, owner.toString());
+                return ps.executeUpdate();
+            }
+        } catch (SQLException ex) {
+            log.warning("deleteAllPages failed: " + ex.getMessage());
+            return 0;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Number of stored pages for {@code owner}. */
+    public int pageCount(UUID owner) {
+        lock.lock();
+        try {
+            if (connection == null) return 0;
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT COUNT(*) FROM vault_pages WHERE owner_uuid = ?")) {
+                ps.setString(1, owner.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? rs.getInt(1) : 0;
+                }
+            }
+        } catch (SQLException ex) {
+            log.warning("pageCount failed: " + ex.getMessage());
+            return 0;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Total serialized size in bytes of every stored page for {@code owner}. */
+    public long totalBytes(UUID owner) {
+        lock.lock();
+        try {
+            if (connection == null) return 0L;
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT COALESCE(SUM(LENGTH(data)), 0) FROM vault_pages WHERE owner_uuid = ?")) {
+                ps.setString(1, owner.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? rs.getLong(1) : 0L;
+                }
+            }
+        } catch (SQLException ex) {
+            log.warning("totalBytes failed: " + ex.getMessage());
+            return 0L;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     // ─── Meta ────────────────────────────────────────────────────────────
 
     public String getMeta(String key) {

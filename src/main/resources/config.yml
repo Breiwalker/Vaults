@@ -1,5 +1,5 @@
 # Internal config schema version. Do not edit manually.
-config-version: 1
+config-version: 2
 
 # ─── Vault Settings ──────────────────────────────────────────────────────
 vault-settings:
@@ -32,6 +32,10 @@ messages:
   # Chat messages
   player-offline: "&cPlayer is offline."
   vault-shared: "&aVault shared with &e%player%"
+  vault-unshared: "&aRevoked &e%player%&a's access."
+  share-already: "&e%player% &calready has access."
+  share-self: "&cYou can't share your vault with yourself."
+  unshare-none: "&e%player% &7doesn't have access."
   no-permission: "&cYou don't have permission."
   vault-load-failed: "&cFailed to load vault. Please try again."
 
@@ -39,6 +43,25 @@ messages:
   shared-list-header: "&eVault access:"
   shared-list-entry: "&7- &f%player%"
   shared-list-empty: "&7- (none)"
+
+  # Admin command (/vaultadmin)
+  admin-usage: "&cUsage: /vaultadmin <open|shares|unshare|clear|reload|info> ..."
+  admin-player-only: "&cThis subcommand must be run by a player."
+  admin-opened: "&aOpened &f%player%&a's vault (page %page%)."
+  admin-shares-header: "&eShares for &f%player%&e:"
+  admin-shares-guests: "&7- shared with &f%player%"
+  admin-shares-owners: "&7- shared to them by &f%player%"
+  admin-shares-none: "&7- (none)"
+  admin-unshared: "&aRevoked &f%guest%&a's access to &f%owner%&a's vault."
+  admin-unshare-none: "&e%guest% &7had no access to &f%owner%&7's vault."
+  admin-cleared: "&aCleared &e%count% &apage(s) for &f%player%&a."
+  admin-clear-confirm: "&cRun &f/vaultadmin clear %player% all confirm &cto wipe all pages."
+  admin-reloaded: "&aConfiguration reloaded."
+  admin-reload-failed: "&cReload failed. Check the console for details."
+  admin-info-header: "&eVault info for &f%player%&e:"
+  admin-info-pages: "&7- Pages: &f%pages%"
+  admin-info-storage: "&7- Storage: &f%kb% KB"
+  admin-info-shares: "&7- Shares out: &f%guests%&7, in: &f%owners%"
 
   # Navigation buttons (these do NOT get the prefix)
   nav-next: "&eNext →"

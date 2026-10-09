@@ -120,8 +120,28 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
             cmd.setTabCompleter(this);
         }
 
+        AdminCommand admin = new AdminCommand(this);
+        var adminCmd = getCommand("vaultadmin");
+        if (adminCmd == null) {
+            getLogger().severe("Command 'vaultadmin' missing from plugin.yml!");
+        } else {
+            adminCmd.setExecutor(admin);
+            adminCmd.setTabCompleter(admin);
+        }
+
         getServer().getPluginManager().registerEvents(this, this);
         checkForUpdates();
+        initMetrics();
+    }
+
+    private void initMetrics() {
+        try {
+            var metrics = new org.bstats.bukkit.Metrics(this, 29399);
+            metrics.addCustomChart(new org.bstats.charts.SimplePie("total_pages",
+                    () -> String.valueOf(getConfig().getInt("vault-settings.total-pages", 2))));
+        } catch (Throwable t) {
+            getLogger().warning("Failed to initialize bStats: " + t.getMessage());
+        }
     }
 
     @Override
@@ -202,13 +222,13 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
 
     // ─── Messages (unchanged) ────────────────────────────────────────────
 
-    private Component msg(String key, String... replacements) {
+    Component msg(String key, String... replacements) {
         String prefix = getConfig().getString("messages.prefix", "");
         return LegacyComponentSerializer.legacySection()
                 .deserialize(prefix + applyReplacements(getConfig().getString("messages." + key, key), replacements));
     }
 
-    private Component rawMsg(String key, String... replacements) {
+    Component rawMsg(String key, String... replacements) {
         return LegacyComponentSerializer.legacySection()
                 .deserialize(applyReplacements(getConfig().getString("messages." + key, key), replacements));
     }
@@ -228,13 +248,13 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
 
     private String key(UUID owner, int page) { return owner + ":" + page; }
 
-    private void runOnMain(Runnable r) {
+    void runOnMain(Runnable r) {
         if (IS_FOLIA) Bukkit.getGlobalRegionScheduler().run(this, t -> r.run());
         else if (Bukkit.isPrimaryThread()) r.run();
         else Bukkit.getScheduler().runTask(this, r);
     }
 
-    private void runOnPlayer(Player p, Runnable r) {
+    void runOnPlayer(Player p, Runnable r) {
         if (IS_FOLIA) p.getScheduler().run(this, t -> r.run(), null);
         else Bukkit.getScheduler().runTask(this, r);
     }
@@ -253,18 +273,12 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
             if (sub.equals("shared")) { showSharedList(player); return true; }
 
             if (sub.equals("share") && args.length >= 2) {
-                final UUID self = player.getUniqueId();
-                final String targetName = args[1];
-                CompletableFuture.runAsync(() -> {
-                    Player target = Bukkit.getPlayerExact(targetName);
-                    if (target == null) {
-                        runOnPlayer(player, () -> player.sendMessage(msg("player-offline")));
-                        return;
-                    }
-                    db.addShare(self, target.getUniqueId());
-                    runOnPlayer(player, () -> player.sendMessage(
-                            msg("vault-shared", "%player%", target.getName())));
-                }, asyncExecutor);
+                shareVault(player, args[1]);
+                return true;
+            }
+
+            if (sub.equals("unshare") && args.length >= 2) {
+                unshareVault(player, args[1]);
                 return true;
             }
 
@@ -276,17 +290,81 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
                     return;
                 }
                 UUID targetUUID = target.getUniqueId();
-                boolean allowed = player.isOp()
-                        || player.hasPermission("vaults.admin")
-                        || db.isSharedWith(targetUUID, player.getUniqueId());
-                if (allowed) runOnPlayer(player, () -> openVault(player, 1, targetUUID));
-                else runOnPlayer(player, () -> player.sendMessage(msg("no-permission")));
+                openVaultChecked(player, 1, targetUUID);
             }, asyncExecutor);
             return true;
         }
 
         openVault(player, 1, player.getUniqueId());
         return true;
+    }
+
+    private void shareVault(Player player, String targetName) {
+        final UUID self = player.getUniqueId();
+        CompletableFuture.runAsync(() -> {
+            OfflinePlayer target = Bukkit.getOfflinePlayer(targetName);
+            if (!target.hasPlayedBefore()) {
+                runOnPlayer(player, () -> player.sendMessage(msg("player-offline")));
+                return;
+            }
+            UUID targetUUID = target.getUniqueId();
+            if (targetUUID.equals(self)) {
+                runOnPlayer(player, () -> player.sendMessage(msg("share-self")));
+                return;
+            }
+            String name = target.getName() != null ? target.getName() : targetName;
+            if (db.isSharedWith(self, targetUUID)) {
+                runOnPlayer(player, () -> player.sendMessage(msg("share-already", "%player%", name)));
+                return;
+            }
+            db.addShare(self, targetUUID);
+            runOnPlayer(player, () -> player.sendMessage(msg("vault-shared", "%player%", name)));
+        }, asyncExecutor);
+    }
+
+    private void unshareVault(Player player, String targetName) {
+        final UUID self = player.getUniqueId();
+        CompletableFuture.runAsync(() -> {
+            OfflinePlayer target = Bukkit.getOfflinePlayer(targetName);
+            if (!target.hasPlayedBefore()) {
+                runOnPlayer(player, () -> player.sendMessage(msg("player-offline")));
+                return;
+            }
+            UUID targetUUID = target.getUniqueId();
+            String name = target.getName() != null ? target.getName() : targetName;
+            if (!db.isSharedWith(self, targetUUID)) {
+                runOnPlayer(player, () -> player.sendMessage(msg("unshare-none", "%player%", name)));
+                return;
+            }
+            boolean removed = db.removeShare(self, targetUUID);
+            runOnPlayer(player, () -> player.sendMessage(removed
+                    ? msg("vault-unshared", "%player%", name)
+                    : msg("unshare-none", "%player%", name)));
+        }, asyncExecutor);
+    }
+
+    /**
+     * Opens {@code ownerUUID}'s vault for {@code p} after verifying access. Owners, operators,
+     * and admins short-circuit without a database hit; everyone else pays one async
+     * {@link DatabaseManager#isSharedWith} round-trip before the inventory is shown.
+     */
+    void openVaultChecked(Player p, int page, UUID ownerUUID) {
+        if (p.getUniqueId().equals(ownerUUID) || p.isOp() || p.hasPermission("vaults.admin")) {
+            runOnPlayer(p, () -> { if (p.isOnline()) openVault(p, page, ownerUUID); });
+            return;
+        }
+        CompletableFuture.runAsync(() -> {
+            boolean shared = db != null && db.isSharedWith(ownerUUID, p.getUniqueId());
+            runOnPlayer(p, () -> {
+                if (!p.isOnline()) return;
+                if (shared) {
+                    openVault(p, page, ownerUUID);
+                } else {
+                    p.closeInventory();
+                    p.sendMessage(msg("no-permission"));
+                }
+            });
+        }, asyncExecutor);
     }
 
     // ─── Vault open logic (unchanged except load path) ───────────────────
@@ -353,9 +431,9 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
             Inventory inv = session.inventory;
             int size = inv.getSize();
             inv.setItem(size - 1, session.page < totalPages
-                    ? createNavItem(Material.ARROW, rawMsg("nav-next"), "next") : null);
+                    ? createNavItem(Material.ARROW, rawMsg("nav-next"), "next") : createNavFiller());
             inv.setItem(size - 9, session.page > 1
-                    ? createNavItem(Material.ARROW, rawMsg("nav-prev"), "prev") : null);
+                    ? createNavItem(Material.ARROW, rawMsg("nav-prev"), "prev") : createNavFiller());
         } finally { lock.unlock(); }
         player.openInventory(session.inventory);
         player.playSound(player.getLocation(), Sound.BLOCK_ENDER_CHEST_OPEN, 1.0f, 1.0f);
@@ -469,9 +547,9 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
                 if (clicked != null && isNavItem(clicked)) {
                     String nav = clicked.getItemMeta().getPersistentDataContainer()
                             .get(navKey, PersistentDataType.STRING);
-                    if (nav != null) {
+                    if ("next".equals(nav) || "prev".equals(nav)) {
                         int nextPage = holder.getPage() + ("next".equals(nav) ? 1 : -1);
-                        runOnPlayer(p, () -> openVault(p, nextPage, holder.getOwnerUUID()));
+                        openVaultChecked(p, nextPage, holder.getOwnerUUID());
                     }
                 }
                 return;
@@ -530,6 +608,10 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
         return item;
     }
 
+    private ItemStack createNavFiller() {
+        return createNavItem(Material.GRAY_STAINED_GLASS_PANE, Component.empty(), "filler");
+    }
+
     // ─── Sharing (now DB-backed) ─────────────────────────────────────────
 
     private void showSharedList(Player p) {
@@ -557,9 +639,26 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
         if (args.length == 1) {
             String prefix = args[0].toLowerCase(Locale.ROOT);
             List<String> out = new ArrayList<>();
-            for (String opt : List.of("share", "shared")) if (opt.startsWith(prefix)) out.add(opt);
+            for (String opt : List.of("share", "unshare", "shared"))
+                if (opt.startsWith(prefix)) out.add(opt);
             return out;
         }
-        return null;
+        if (args.length == 2) {
+            String sub = args[0].toLowerCase(Locale.ROOT);
+            if (sub.equals("share") || sub.equals("unshare")) {
+                String prefix = args[1].toLowerCase(Locale.ROOT);
+                List<String> out = new ArrayList<>();
+                for (Player p : Bukkit.getOnlinePlayers())
+                    if (p.getName().toLowerCase(Locale.ROOT).startsWith(prefix)) out.add(p.getName());
+                return out;
+            }
+        }
+        return List.of();
     }
+
+    // ─── Package-private accessors (used by AdminCommand) ────────────────
+
+    DatabaseManager db() { return db; }
+
+    Executor asyncExecutor() { return asyncExecutor; }
 }

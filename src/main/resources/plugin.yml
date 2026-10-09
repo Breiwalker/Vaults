@@ -1,7 +1,7 @@
 name: Vaults
 version: ${version}
 main: com.BreiwalkerSMP.Vaults.Vaults
-api-version: '1.21.5'
+api-version: '1.21.11'
 authors: [Breiwalker]
 folia-supported: true
 
@@ -11,10 +11,15 @@ libraries:
 commands:
   vault:
     description: Open your vault
-    usage: /vault [share|shared|<player>]
+    usage: /vault [share|unshare|shared|<player>]
+  vaultadmin:
+    description: Manage Vaults
+    aliases: [va]
+    usage: /vaultadmin <open|shares|unshare|clear|reload|info> ...
+    permission: vaults.admin
 permissions:
   vaults.admin:
-    description: Open any player's vault
+    description: Manage any player's vault and shares
     default: op
   vaults.update:
     description: Receive update notifications
