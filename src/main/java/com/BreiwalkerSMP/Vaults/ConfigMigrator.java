@@ -17,7 +17,7 @@ import java.io.File;
  */
 public final class ConfigMigrator {
 
-    public static final int CURRENT_CONFIG_VERSION = 1;
+    public static final int CURRENT_CONFIG_VERSION = 2;
 
     private ConfigMigrator() {
     }
@@ -63,6 +63,9 @@ public final class ConfigMigrator {
             //       config.set("old.key", null);
             //   }
             case 0 -> { }
+            // v1 -> v2: added sharing-revoke and /vaultadmin message keys. No keys were
+            // renamed, so this step is empty; new keys are merged in by {@link #migrate}.
+            case 1 -> { }
             default -> { }
         }
     }
