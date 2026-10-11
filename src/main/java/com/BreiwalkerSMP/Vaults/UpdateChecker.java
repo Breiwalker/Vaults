@@ -32,6 +32,7 @@ public final class UpdateChecker {
     private final String minecraftVersion;
     private final String channel;
     private final String userAgent;
+    private String latestVersionType = "release";
 
     /**
      * @param channel one of {@code release}, {@code beta}, {@code alpha} or {@code all}.
@@ -44,8 +45,17 @@ public final class UpdateChecker {
         this.userAgent = "BreiwalkerSMP/Vaults/" + currentVersion + " (contact: BreiwalkerSMP)";
     }
 
+    /**
+     * The release channel of the version returned by the last {@link #check()} call
+     * ({@code release}, {@code beta} or {@code alpha}).
+     */
+    public String getLatestVersionType() {
+        return latestVersionType == null ? "release" : latestVersionType;
+    }
+
     /** Returns the newest compatible version newer than the current one, or {@code null}. */
     public String check() {
+        latestVersionType = "release";
         JsonArray versions;
         try {
             versions = fetchVersions();
@@ -81,7 +91,10 @@ public final class UpdateChecker {
             String num = getVersionNumber(v);
             if (num == null || num.isEmpty()) continue;
             if (compareVersions(num, currentVersion) <= 0) continue;
-            if (best == null || compareVersions(num, best) > 0) best = num;
+            if (best == null || compareVersions(num, best) > 0) {
+                best = num;
+                latestVersionType = versionType(v);
+            }
         }
         return best;
     }
@@ -116,8 +129,7 @@ public final class UpdateChecker {
     }
 
     private boolean matchesChannel(JsonObject v) {
-        String type = v.has("version_type") && !v.get("version_type").isJsonNull()
-                ? v.get("version_type").getAsString() : "release";
+        String type = versionType(v);
         switch (channel) {
             case "all":   return true;
             case "alpha": return true;                          // release + beta + alpha
@@ -125,6 +137,13 @@ public final class UpdateChecker {
             case "release":
             default:      return "release".equals(type);
         }
+    }
+
+    /** The release channel ({@code release}, {@code beta} or {@code alpha}) of a Modrinth version. */
+    private static String versionType(JsonObject v) {
+        String type = v.has("version_type") && !v.get("version_type").isJsonNull()
+                ? v.get("version_type").getAsString() : "release";
+        return type.toLowerCase(Locale.ROOT);
     }
 
     private boolean matchesLoader(JsonObject v) {
