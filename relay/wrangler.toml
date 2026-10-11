@@ -1,0 +1,19 @@
+name = "vaults-reports"
+main = "worker.js"
+compatibility_date = "2024-06-01"
+
+# ─── Deploy ───────────────────────────────────────────────────────────────
+# 1. wrangler secret put DISCORD_WEBHOOK     # paste the Discord webhook URL
+# 2. wrangler deploy
+# 3. Point the plugin's telemetry.endpoint at:
+#      https://vaults-reports.<your-account>.workers.dev/report
+#
+# Optional custom domain (uncomment and adjust):
+# routes = [
+#   { pattern = "vaults-reports.example.com/report", custom_domain = true }
+# ]
+
+# Variables can be set here instead of as secrets when they are not sensitive.
+# The Discord webhook MUST be a secret, never a plaintext [vars] entry:
+# [vars]
+#   # (none required)

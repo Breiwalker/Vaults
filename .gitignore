@@ -2,3 +2,8 @@
 /.gradle/
 /build/
 /build/classes/java/main/
+
+# Cloudflare Worker local secrets / build output
+/relay/.dev.vars
+/relay/node_modules/
+/relay/.wrangler/

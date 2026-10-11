@@ -1,5 +1,6 @@
 package com.BreiwalkerSMP.Vaults;
 
+import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import org.bukkit.Bukkit;
@@ -26,10 +27,11 @@ import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.util.io.BukkitObjectInputStream;
-import org.bukkit.util.io.BukkitObjectOutputStream;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.File;
 import java.sql.SQLException;
 import java.util.ArrayList;
@@ -45,9 +47,6 @@ import java.util.concurrent.locks.ReentrantLock;
 
 public class Vaults extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
 
-    private static final boolean IS_FOLIA =
-            hasClass("io.papermc.paper.threadedregions.RegionScheduler");
-
     private final Map<String, VaultSession> sessions = new ConcurrentHashMap<>();
     private final Map<String, CompletableFuture<VaultSession>> loadingFutures = new ConcurrentHashMap<>();
     private final Map<String, CompletableFuture<Void>> pendingSaves = new ConcurrentHashMap<>();
@@ -58,7 +57,12 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
     private volatile CompletableFuture<Void> dbInitFuture;
 
     private volatile String latestVersion = null;
+    private volatile String latestVersionType = "release";
     private volatile boolean updateAvailable = false;
+
+    private volatile int cachedVaultUsers = 0;
+    private TelemetryReporter telemetry;
+    private ScheduledTask userCountTask;
 
     // ─── Holder & Session (unchanged) ────────────────────────────────────
 
@@ -87,14 +91,23 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
     public void onEnable() {
         saveDefaultConfig();
         getConfig().options().copyDefaults(true);
-        ConfigMigrator.migrate(this);
+        try {
+            ConfigMigrator.migrate(this);
+        } catch (Throwable t) {
+            getLogger().warning("Config migration failed: " + t.getMessage());
+            reportTelemetryError(t);
+        }
 
         navKey = new NamespacedKey(this, "nav");
 
-        if (IS_FOLIA) {
-            asyncExecutor = r -> Bukkit.getAsyncScheduler().runNow(this, t -> r.run());
-        } else {
-            asyncExecutor = r -> Bukkit.getScheduler().runTaskAsynchronously(this, r);
+        asyncExecutor = r -> Bukkit.getAsyncScheduler().runNow(this, t -> r.run());
+
+        // Construct early (reads config + state only) so failures further down can be reported.
+        // The startup/heartbeat schedule is started later, after metrics, by telemetry.init().
+        try {
+            telemetry = new TelemetryReporter(this);
+        } catch (Throwable t) {
+            getLogger().warning("Failed to initialize telemetry: " + t.getMessage());
         }
 
         // ─── Database init (async, then migrate) ─────────────────────────
@@ -108,6 +121,7 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
                 db.migrateFromYamlIfNeeded();
             } catch (SQLException ex) {
                 getLogger().severe("Failed to open database: " + ex.getMessage());
+                reportTelemetryError(ex);
                 runOnMain(() -> getServer().getPluginManager().disablePlugin(this));
             }
         }, asyncExecutor);
@@ -132,6 +146,11 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
         getServer().getPluginManager().registerEvents(this, this);
         checkForUpdates();
         initMetrics();
+        startUserCountRefresh();
+        if (telemetry != null) {
+            try { telemetry.init(); }
+            catch (Throwable t) { getLogger().warning("Failed to start telemetry: " + t.getMessage()); }
+        }
     }
 
     private void initMetrics() {
@@ -139,13 +158,72 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
             var metrics = new org.bstats.bukkit.Metrics(this, 29399);
             metrics.addCustomChart(new org.bstats.charts.SimplePie("total_pages",
                     () -> String.valueOf(getConfig().getInt("vault-settings.total-pages", 2))));
+            // Only ever read the cached volatile / config here — never touch the database.
+            metrics.addCustomChart(new org.bstats.charts.SimplePie("vault_users",
+                    () -> bucketVaultUsers(cachedVaultUsers)));
+            metrics.addCustomChart(new org.bstats.charts.SimplePie("update_checker",
+                    () -> getConfig().getBoolean("update-checker.enabled", true) ? "enabled" : "disabled"));
         } catch (Throwable t) {
             getLogger().warning("Failed to initialize bStats: " + t.getMessage());
+            reportTelemetryError(t);
         }
+    }
+
+    private static String bucketVaultUsers(int n) {
+        if (n <= 0) return "0";
+        if (n <= 10) return "1-10";
+        if (n <= 100) return "11-100";
+        if (n <= 1000) return "101-1000";
+        return "1000+";
+    }
+
+    /** Refreshes {@link #cachedVaultUsers} immediately and every 30 minutes (bStats' submit interval). */
+    private void startUserCountRefresh() {
+        cancelUserCountRefresh();
+        try {
+            userCountTask = Bukkit.getAsyncScheduler().runAtFixedRate(this,
+                    t -> refreshVaultUsers(), 0L, 30L, TimeUnit.MINUTES);
+        } catch (Throwable t) {
+            getLogger().warning("Failed to schedule vault user count refresh: " + t.getMessage());
+        }
+    }
+
+    private void refreshVaultUsers() {
+        try {
+            DatabaseManager d = db;
+            if (d != null) cachedVaultUsers = d.countVaultUsers();
+        } catch (Throwable t) {
+            getLogger().warning("Failed to refresh vault user count: " + t.getMessage());
+        }
+    }
+
+    private void cancelUserCountRefresh() {
+        if (userCountTask != null) {
+            try { userCountTask.cancel(); } catch (Throwable ignored) { }
+            userCountTask = null;
+        }
+    }
+
+    void reportTelemetryError(Throwable t) {
+        TelemetryReporter r = telemetry;
+        if (r == null || t == null) return;
+        try { r.reportError(t); } catch (Throwable ignored) { }
+    }
+
+    /** Rebuilds the telemetry schedule without duplicating tasks (used by /vaultadmin reload). */
+    void restartTelemetry() {
+        TelemetryReporter r = telemetry;
+        if (r == null) return;
+        try { r.reload(); } catch (Throwable ignored) { }
     }
 
     @Override
     public void onDisable() {
+        if (telemetry != null) {
+            try { telemetry.shutdown(); } catch (Throwable ignored) { }
+        }
+        cancelUserCountRefresh();
+
         // Wait for the async DB init to settle so we never close after it opens.
         if (dbInitFuture != null) {
             try { dbInitFuture.get(10, TimeUnit.SECONDS); }
@@ -186,17 +264,18 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
             if (newVersion == null) return;
 
             latestVersion = newVersion;
+            latestVersionType = checker.getLatestVersionType();
             updateAvailable = true;
 
             if (getConfig().getBoolean("update-checker.notify-console", true)) {
-                getLogger().info("§eA new version of Vaults is available: §f" + newVersion
-                        + " §7(you have " + getDescription().getVersion() + ")");
-                getLogger().info("§7Download: §bhttps://modrinth.com/plugin/vaults");
+                getServer().getConsoleSender().sendMessage(rawMsg(updateMessageKey("update-available"),
+                        "%version%", newVersion, "%current%", getDescription().getVersion()));
+                getServer().getConsoleSender().sendMessage(rawMsg("update-download"));
             }
         }, asyncExecutor);
     }
 
-    private String serverMinecraftVersion() {
+    String serverMinecraftVersion() {
         try {
             String v = Bukkit.getMinecraftVersion();
             return v != null ? v : "";
@@ -213,11 +292,24 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
         String perm = getConfig().getString("update-checker.notify-permission", "vaults.update");
         if (!p.isOp() && !p.hasPermission(perm)) return;
         runOnPlayer(p, () -> {
-            p.sendMessage(msg("update-available",
+            p.sendMessage(msg(updateMessageKey("update-available"),
                     "%version%", latestVersion,
                     "%current%", getDescription().getVersion()));
             p.sendMessage(rawMsg("update-download"));
         });
+    }
+
+    /**
+     * Picks a channel-specific update message ({@code <base>-beta} / {@code <base>-alpha}) when the
+     * newest available version is a pre-release and the key is present in config; otherwise {@code base}.
+     */
+    private String updateMessageKey(String base) {
+        String type = latestVersionType;
+        if ("beta".equals(type) || "alpha".equals(type)) {
+            String candidate = base + "-" + type;
+            if (getConfig().contains("messages." + candidate)) return candidate;
+        }
+        return base;
     }
 
     // ─── Messages (unchanged) ────────────────────────────────────────────
@@ -240,23 +332,20 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
         return s;
     }
 
-    // ─── Threading helpers (unchanged) ───────────────────────────────────
-
-    private static boolean hasClass(String cn) {
-        try { Class.forName(cn); return true; } catch (ClassNotFoundException e) { return false; }
-    }
+    // ─── Threading helpers ───────────────────────────────────────────────
+    //
+    // The Paper/Folia scheduler API is used unconditionally. Paper implements these
+    // schedulers internally (global -> main thread, async -> async thread), so a single
+    // code path works correctly on both Paper and Folia with no runtime feature detection.
 
     private String key(UUID owner, int page) { return owner + ":" + page; }
 
     void runOnMain(Runnable r) {
-        if (IS_FOLIA) Bukkit.getGlobalRegionScheduler().run(this, t -> r.run());
-        else if (Bukkit.isPrimaryThread()) r.run();
-        else Bukkit.getScheduler().runTask(this, r);
+        Bukkit.getGlobalRegionScheduler().run(this, t -> r.run());
     }
 
     void runOnPlayer(Player p, Runnable r) {
-        if (IS_FOLIA) p.getScheduler().run(this, t -> r.run(), null);
-        else Bukkit.getScheduler().runTask(this, r);
+        p.getScheduler().run(this, t -> r.run(), null);
     }
 
     // ─── Command handling (unchanged) ────────────────────────────────────
@@ -418,6 +507,7 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
             runOnPlayer(player, () -> { if (player.isOnline()) openSession(player, actual, totalPages); });
         }).exceptionally(ex -> {
             getLogger().warning("Failed to load vault " + cacheKey + ": " + ex);
+            reportTelemetryError(ex);
             if (player.isOnline())
                 runOnPlayer(player, () -> player.sendMessage(msg("vault-load-failed")));
             return null;
@@ -448,6 +538,7 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
             return itemStackArrayFromBytes(blob);
         } catch (Exception ex) {
             getLogger().warning("Failed to deserialize vault " + owner + " p" + page + ": " + ex.getMessage());
+            reportTelemetryError(ex);
             return new ItemStack[0];
         }
     }
@@ -485,6 +576,7 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
                 db.savePage(ownerUUID, page, itemStackArrayToBytes(finalSnap));
             } catch (Exception ex) {
                 getLogger().warning("Failed to save vault " + cacheKey + ": " + ex.getMessage());
+                reportTelemetryError(ex);
             }
         }, asyncExecutor);
 
@@ -504,23 +596,64 @@ public class Vaults extends JavaPlugin implements Listener, CommandExecutor, Tab
             if (p != null && !p.isDone()) return;
             sessions.remove(cacheKey, s);
         };
-        if (!IS_FOLIA && Bukkit.isPrimaryThread()) check.run();
-        else runOnMain(check);
+        runOnMain(check);
     }
 
-    // ─── Serialization (now BLOB, no Base64 in DB) ───────────────────────
+    // ─── Serialization (NBT-based; legacy Java-stream blobs still readable) ──
+
+    /** Java Object-Serialization stream header (`AC ED 00 05`) emitted by the old codec. */
+    private static final byte[] JAVA_STREAM_MAGIC = { (byte) 0xAC, (byte) 0xED, 0x00, 0x05 };
 
     public byte[] itemStackArrayToBytes(ItemStack[] items) throws Exception {
-        try (ByteArrayOutputStream os = new ByteArrayOutputStream();
-             BukkitObjectOutputStream out = new BukkitObjectOutputStream(os)) {
+        ByteArrayOutputStream os = new ByteArrayOutputStream();
+        try (DataOutputStream out = new DataOutputStream(os)) {
             out.writeInt(items.length);
-            for (ItemStack item : items) out.writeObject(item);
-            out.flush();
-            return os.toByteArray();
+            for (ItemStack item : items) {
+                if (item == null || item.isEmpty()) {
+                    out.writeInt(-1);
+                } else {
+                    byte[] blob = item.serializeAsBytes();
+                    out.writeInt(blob.length);
+                    out.write(blob);
+                }
+            }
         }
+        return os.toByteArray();
     }
 
     public ItemStack[] itemStackArrayFromBytes(byte[] bytes) throws Exception {
+        // Detect the on-disk format from the data itself rather than the server version:
+        //  - new saves are length-prefixed NBT and never start with AC ED 00 05
+        //  - old 2.0 saves are Java serialized streams and start with that magic header
+        if (isLegacyStream(bytes)) {
+            return itemStackArrayFromLegacyBytes(bytes);
+        }
+        try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes))) {
+            int len = in.readInt();
+            ItemStack[] items = new ItemStack[len];
+            for (int i = 0; i < len; i++) {
+                int size = in.readInt();
+                if (size < 0) {
+                    items[i] = null;
+                } else {
+                    byte[] blob = new byte[size];
+                    in.readFully(blob);
+                    items[i] = ItemStack.deserializeBytes(blob);
+                }
+            }
+            return items;
+        }
+    }
+
+    private boolean isLegacyStream(byte[] bytes) {
+        if (bytes == null || bytes.length < JAVA_STREAM_MAGIC.length) return false;
+        for (int i = 0; i < JAVA_STREAM_MAGIC.length; i++) {
+            if (bytes[i] != JAVA_STREAM_MAGIC[i]) return false;
+        }
+        return true;
+    }
+
+    private ItemStack[] itemStackArrayFromLegacyBytes(byte[] bytes) throws Exception {
         try (ByteArrayInputStream is = new ByteArrayInputStream(bytes);
              BukkitObjectInputStream in = new BukkitObjectInputStream(is)) {
             int len = in.readInt();

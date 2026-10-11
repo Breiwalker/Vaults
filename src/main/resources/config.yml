@@ -1,5 +1,5 @@
 # Internal config schema version. Do not edit manually.
-config-version: 2
+config-version: 3
 
 # ─── Vault Settings ──────────────────────────────────────────────────────
 vault-settings:
@@ -69,4 +69,22 @@ messages:
 
   # Update checker
   update-available: "&eA new version of Vaults is available: &f%version% &7(you have %current%)"
+  update-available-beta: "&eA new &bBETA&e version of Vaults is available: &f%version% &7(you have %current%)"
+  update-available-alpha: "&eA new &dALPHA&e version of Vaults is available: &f%version% &7(you have %current%)"
   update-download: "&7Download: &bhttps://modrinth.com/plugin/vaults"
+
+# ─── Telemetry ───────────────────────────────────────────────────────────
+# Sends an anonymous server report to a public relay so the developer can see
+# what servers run Vaults and any plugin-side errors. This is SEPARATE from
+# bStats (which is opted out via bStats' own config/bstats/config.yml).
+# No server IP, player names or UUIDs are ever sent. See the README for details.
+telemetry:
+  # Master switch for the relayed report. Set to false for a silent no-op.
+  enabled: true
+  # Public relay endpoint. Leave blank to disable sending entirely (silent no-op).
+  # You may point this at your own relay if you host one.
+  endpoint: "https://vaults-reports.breiwalker.workers.dev/report"
+  # How often to send a heartbeat report, in minutes (default 360 = 6 hours).
+  heartbeat-minutes: 360
+  # Report Vaults' own exceptions (never other plugins' exceptions).
+  report-errors: true

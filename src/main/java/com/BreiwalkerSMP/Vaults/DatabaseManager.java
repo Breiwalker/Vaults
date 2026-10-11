@@ -413,6 +413,24 @@ public final class DatabaseManager {
         }
     }
 
+    /** Number of distinct owners that have at least one stored page. */
+    public int countVaultUsers() {
+        lock.lock();
+        try {
+            if (connection == null) return 0;
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT COUNT(DISTINCT owner_uuid) FROM vault_pages");
+                 ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : 0;
+            }
+        } catch (SQLException ex) {
+            log.warning("countVaultUsers failed: " + ex.getMessage());
+            return 0;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /** Total serialized size in bytes of every stored page for {@code owner}. */
     public long totalBytes(UUID owner) {
         lock.lock();

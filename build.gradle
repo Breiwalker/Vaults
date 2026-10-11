@@ -1,11 +1,11 @@
 plugins {
     id 'java'
-    id("xyz.jpenilla.run-paper") version "2.3.1"
-    id("com.gradleup.shadow") version "8.3.0"
+    id("xyz.jpenilla.run-paper") version "3.1.0"
+    id("com.gradleup.shadow") version "9.6.1"
 }
 
 group = 'com.BreiwalkerSMP'
-version = '2.1'
+version = '2.2.1'
 
 repositories {
     mavenCentral()
@@ -16,13 +16,13 @@ repositories {
 }
 
 dependencies {
-    compileOnly("io.papermc.paper:paper-api:1.21.11-R0.1-SNAPSHOT")
+    compileOnly("io.papermc.paper:paper-api:1.20.6-R0.1-SNAPSHOT")
     implementation("org.bstats:bstats-bukkit:3.1.0")
     compileOnly("org.xerial:sqlite-jdbc:3.46.0.0")
 }
 
 tasks.named("runServer") {
-    minecraftVersion = "1.21.11"
+    minecraftVersion("1.20.5")
 }
 
 tasks.named("shadowJar") {

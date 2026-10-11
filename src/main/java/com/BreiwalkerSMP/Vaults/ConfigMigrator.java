@@ -17,7 +17,7 @@ import java.io.File;
  */
 public final class ConfigMigrator {
 
-    public static final int CURRENT_CONFIG_VERSION = 2;
+    public static final int CURRENT_CONFIG_VERSION = 3;
 
     private ConfigMigrator() {
     }
@@ -66,6 +66,9 @@ public final class ConfigMigrator {
             // v1 -> v2: added sharing-revoke and /vaultadmin message keys. No keys were
             // renamed, so this step is empty; new keys are merged in by {@link #migrate}.
             case 1 -> { }
+            // v2 -> v3: added the telemetry section. No keys were renamed, so this step is
+            // empty; new keys are merged in by {@link #migrate}.
+            case 2 -> { }
             default -> { }
         }
     }

@@ -1,7 +1,7 @@
 name: Vaults
 version: ${version}
 main: com.BreiwalkerSMP.Vaults.Vaults
-api-version: '1.21.11'
+api-version: '1.20.5'
 authors: [Breiwalker]
 folia-supported: true
 

@@ -177,9 +177,11 @@ public final class AdminCommand implements CommandExecutor, TabCompleter {
                 plugin.saveDefaultConfig();
                 plugin.getConfig().options().copyDefaults(true);
                 ConfigMigrator.migrate(plugin);
+                plugin.restartTelemetry();
                 sender.sendMessage(plugin.msg("admin-reloaded"));
             } catch (Throwable t) {
                 plugin.getLogger().warning("Config reload failed: " + t.getMessage());
+                plugin.reportTelemetryError(t);
                 sender.sendMessage(plugin.msg("admin-reload-failed"));
             }
         });
